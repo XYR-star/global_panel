@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Market Dashboard
+    orgId: 1
+    folder: Market
+    type: file
+    disableDeletion: false
+    editable: false
+    options:
+      path: /etc/grafana/dashboards
