@@ -1,2 +1,6 @@
 psycopg2-binary==2.9.10
 requests==2.32.3
+akshare==1.18.55
+fastapi==0.124.2
+uvicorn[standard]==0.38.0
+pypdf==6.4.1

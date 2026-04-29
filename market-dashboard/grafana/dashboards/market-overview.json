@@ -839,7 +839,7 @@
           },
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT source, ok, message, last_run, updated_at FROM data_sync_status ORDER BY source;",
+          "rawSql": "SELECT source, ok, message, latest_observation_ts AS latest_observation, last_run AS sync_run, ROUND(EXTRACT(EPOCH FROM (last_run - latest_observation_ts)) / 3600, 1) AS observation_lag_hours, updated_at FROM data_sync_status WHERE source <> 'fredgraph' ORDER BY source;",
           "refId": "A"
         }
       ],

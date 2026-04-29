@@ -1,0 +1,11 @@
+[Unit]
+Description=Generate market dashboard AI research report
+After=network-online.target docker.service market-sync.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/global_panel/market-dashboard
+EnvironmentFile=/etc/market-dashboard.env
+ExecStart=/root/global_panel/market-dashboard/.venv/bin/python /root/global_panel/market-dashboard/generate_agent_report.py
+

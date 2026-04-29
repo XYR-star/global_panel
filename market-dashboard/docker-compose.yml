@@ -10,7 +10,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - ${MARKET_DATA_ROOT:-./data}/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
@@ -39,6 +39,33 @@ services:
       GF_SERVER_ROOT_URL: https://${GRAFANA_DOMAIN}
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/market-overview.json
     volumes:
-      - ./data/grafana:/var/lib/grafana
+      - ${MARKET_DATA_ROOT:-./data}/grafana:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
       - ./grafana/dashboards:/etc/grafana/dashboards
+
+  ai-research:
+    build:
+      context: .
+      dockerfile: Dockerfile.ai
+    container_name: market-dashboard-ai-research
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /app
+    ports:
+      - "127.0.0.1:${AI_RESEARCH_HTTP_PORT:-8001}:8000"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      AGENT_REPORT_TYPE: ${AGENT_REPORT_TYPE:-market_research_v1}
+      AGENT_TEMPERATURE: ${AGENT_TEMPERATURE:-0.2}
+      AGENT_LLM_TIMEOUT_SECONDS: ${AGENT_LLM_TIMEOUT_SECONDS:-90}
+    volumes:
+      - .:/app:ro

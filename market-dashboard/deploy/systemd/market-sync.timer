@@ -3,9 +3,9 @@ Description=Run market dashboard sync every 10 minutes
 
 [Timer]
 OnBootSec=2min
+OnActiveSec=2min
 OnUnitActiveSec=10min
 Unit=market-sync.service
 
 [Install]
 WantedBy=timers.target
-

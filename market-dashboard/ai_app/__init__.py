@@ -1,0 +1,2 @@
+"""AI research subpage app."""
+
