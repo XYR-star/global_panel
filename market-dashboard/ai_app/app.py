@@ -31,6 +31,9 @@ from sync_portfolio_data import (
     insert_risk_metrics,
     insert_transactions,
     insert_underlying,
+    rebuild_all_summaries,
+    rebuild_batch_summary,
+    refresh_summary_derived_fields,
 )
 
 APP_TITLE = "Ricky Portfolio"
@@ -43,6 +46,7 @@ SESSION_SECRET = (os.getenv("PORTFOLIO_SESSION_SECRET") or os.getenv("POSTGRES_P
 AKSHARE_ENABLED = os.getenv("PORTFOLIO_AKSHARE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 LOGIN_FAILURE_LIMIT = int(os.getenv("PORTFOLIO_LOGIN_FAILURE_LIMIT", "5"))
 LOGIN_LOCKOUT_MINUTES = int(os.getenv("PORTFOLIO_LOGIN_LOCKOUT_MINUTES", "30"))
+BACKUP_ROOT = Path(os.getenv("PORTFOLIO_BACKUP_ROOT", "/var/lib/portfolio-app/backups"))
 
 app = FastAPI(title=APP_TITLE)
 
@@ -99,6 +103,74 @@ def ensure_portfolio_schema() -> None:
                     ON portfolio_import_batches (status, is_archived, uploaded_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_portfolio_batches_sha
                     ON portfolio_import_batches (file_sha256);
+
+                CREATE INDEX IF NOT EXISTS idx_portfolio_batches_asof_uploaded
+                    ON portfolio_import_batches (as_of_date DESC, uploaded_at DESC, batch_id DESC)
+                    WHERE status IN ('complete', 'partial');
+                CREATE INDEX IF NOT EXISTS idx_portfolio_positions_security_asof
+                    ON portfolio_positions (security_code, as_of_date DESC);
+                CREATE INDEX IF NOT EXISTS idx_portfolio_transactions_batch_date
+                    ON portfolio_transactions (batch_id, trade_date DESC);
+                CREATE INDEX IF NOT EXISTS idx_portfolio_asset_allocation_bucket_asof
+                    ON portfolio_asset_allocation (allocation_bucket, as_of_date);
+
+                CREATE TABLE IF NOT EXISTS portfolio_daily_summary (
+                    batch_id TEXT PRIMARY KEY REFERENCES portfolio_import_batches(batch_id) ON DELETE CASCADE,
+                    as_of_date DATE NOT NULL,
+                    uploaded_at TIMESTAMPTZ NOT NULL,
+                    original_filename TEXT,
+                    status TEXT NOT NULL,
+                    total_assets NUMERIC(20, 6),
+                    total_assets_change NUMERIC(20, 6),
+                    position_count INTEGER NOT NULL DEFAULT 0,
+                    today_pnl NUMERIC(20, 6),
+                    holding_pnl NUMERIC(20, 6),
+                    cumulative_pnl NUMERIC(20, 6),
+                    max_position_weight DOUBLE PRECISION,
+                    top3_weight DOUBLE PRECISION,
+                    top5_weight DOUBLE PRECISION,
+                    top10_underlying_weight DOUBLE PRECISION,
+                    equity_like_weight DOUBLE PRECISION,
+                    bond_like_weight DOUBLE PRECISION,
+                    qdii_weight DOUBLE PRECISION,
+                    cash_weight DOUBLE PRECISION,
+                    max_industry_name TEXT,
+                    max_industry_weight DOUBLE PRECISION,
+                    drawdown_estimated DOUBLE PRECISION,
+                    trailing_loss_streak INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'computed',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_portfolio_daily_summary_asof_uploaded
+                    ON portfolio_daily_summary (as_of_date DESC, uploaded_at DESC, batch_id DESC);
+                CREATE TABLE IF NOT EXISTS portfolio_daily_allocation (
+                    batch_id TEXT NOT NULL REFERENCES portfolio_import_batches(batch_id) ON DELETE CASCADE,
+                    as_of_date DATE NOT NULL,
+                    allocation_bucket TEXT NOT NULL,
+                    amount NUMERIC(20, 6) NOT NULL DEFAULT 0,
+                    weight DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'computed',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (batch_id, allocation_bucket)
+                );
+                CREATE INDEX IF NOT EXISTS idx_portfolio_daily_allocation_bucket_asof
+                    ON portfolio_daily_allocation (allocation_bucket, as_of_date);
+                CREATE TABLE IF NOT EXISTS portfolio_daily_exposure (
+                    batch_id TEXT NOT NULL REFERENCES portfolio_import_batches(batch_id) ON DELETE CASCADE,
+                    as_of_date DATE NOT NULL,
+                    exposure_type TEXT NOT NULL,
+                    exposure_code TEXT NOT NULL DEFAULT '',
+                    exposure_name TEXT NOT NULL,
+                    amount NUMERIC(20, 6),
+                    weight DOUBLE PRECISION,
+                    source_count INTEGER NOT NULL DEFAULT 1,
+                    contributors JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'computed',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (batch_id, exposure_type, exposure_code, exposure_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_portfolio_daily_exposure_type_weight
+                    ON portfolio_daily_exposure (batch_id, exposure_type, weight DESC);
 
                 CREATE TABLE IF NOT EXISTS portfolio_login_failures (
                     failure_key TEXT PRIMARY KEY,
@@ -375,6 +447,25 @@ def batch_positions(batch_id: str, limit: int | None = None) -> list[dict[str, A
 
 
 def batch_metrics(batch_id: str) -> dict[str, Any]:
+    summary = one(
+        """
+        SELECT top3_weight, top5_weight, top10_underlying_weight,
+               equity_like_weight, bond_like_weight, qdii_weight, cash_weight
+        FROM portfolio_daily_summary
+        WHERE batch_id = %s
+        """,
+        (batch_id,),
+    )
+    if summary:
+        return {
+            "top3_position_weight": summary.get("top3_weight"),
+            "top5_position_weight": summary.get("top5_weight"),
+            "top10_underlying_weight": summary.get("top10_underlying_weight"),
+            "equity_like_weight": summary.get("equity_like_weight"),
+            "bond_like_weight": summary.get("bond_like_weight"),
+            "qdii_weight": summary.get("qdii_weight"),
+            "cash_weight_estimated": summary.get("cash_weight"),
+        }
     data = rows(
         "SELECT metric_name, metric_value FROM portfolio_risk_metrics WHERE batch_id = %s AND metric_scope = 'portfolio'",
         (batch_id,),
@@ -383,6 +474,12 @@ def batch_metrics(batch_id: str) -> dict[str, Any]:
 
 
 def asset_allocation(batch_id: str) -> list[dict[str, Any]]:
+    data = rows(
+        "SELECT allocation_bucket, amount, weight FROM portfolio_daily_allocation WHERE batch_id = %s ORDER BY weight DESC",
+        (batch_id,),
+    )
+    if data:
+        return data
     return rows(
         "SELECT allocation_bucket, amount, weight FROM portfolio_asset_allocation WHERE batch_id = %s ORDER BY weight DESC",
         (batch_id,),
@@ -390,6 +487,18 @@ def asset_allocation(batch_id: str) -> list[dict[str, Any]]:
 
 
 def industry_allocation(batch_id: str) -> list[dict[str, Any]]:
+    data = rows(
+        """
+        SELECT exposure_name AS industry_name, weight
+        FROM portfolio_daily_exposure
+        WHERE batch_id = %s AND exposure_type = 'industry'
+        ORDER BY weight DESC NULLS LAST
+        LIMIT 12
+        """,
+        (batch_id,),
+    )
+    if data:
+        return data
     data = rows(
         """
         SELECT industry_name, SUM(lookthrough_portfolio_weight) AS weight
@@ -418,6 +527,23 @@ def industry_allocation(batch_id: str) -> list[dict[str, Any]]:
 
 
 def underlying(batch_id: str) -> list[dict[str, Any]]:
+    data = rows(
+        """
+        SELECT exposure_code AS underlying_code,
+               exposure_name AS underlying_name,
+               'lookthrough' AS underlying_type,
+               amount,
+               weight,
+               source_count
+        FROM portfolio_daily_exposure
+        WHERE batch_id = %s AND exposure_type = 'underlying'
+        ORDER BY weight DESC NULLS LAST
+        LIMIT 20
+        """,
+        (batch_id,),
+    )
+    if data:
+        return data
     return rows(
         """
         SELECT underlying_code, underlying_name, underlying_type,
@@ -442,21 +568,32 @@ def xray_data(batch_id: str) -> dict[str, Any]:
     overlaps = [item for item in under if int(item.get("source_count") or 0) > 1]
     industry_rows = rows(
         """
-        SELECT industry_name,
-               SUM(lookthrough_portfolio_weight) AS weight,
-               jsonb_agg(jsonb_build_object(
-                    'parent_code', parent_code,
-                    'parent_name', parent_name,
-                    'weight', lookthrough_portfolio_weight
-               ) ORDER BY lookthrough_portfolio_weight DESC) AS contributors
-        FROM portfolio_industry_allocations
-        WHERE batch_id = %s
-        GROUP BY industry_name
+        SELECT exposure_name AS industry_name, weight, contributors
+        FROM portfolio_daily_exposure
+        WHERE batch_id = %s AND exposure_type = 'industry'
         ORDER BY weight DESC NULLS LAST
         LIMIT 12
         """,
         (batch_id,),
     )
+    if not industry_rows:
+        industry_rows = rows(
+            """
+            SELECT industry_name,
+                   SUM(lookthrough_portfolio_weight) AS weight,
+                   jsonb_agg(jsonb_build_object(
+                        'parent_code', parent_code,
+                        'parent_name', parent_name,
+                        'weight', lookthrough_portfolio_weight
+                   ) ORDER BY lookthrough_portfolio_weight DESC) AS contributors
+            FROM portfolio_industry_allocations
+            WHERE batch_id = %s
+            GROUP BY industry_name
+            ORDER BY weight DESC NULLS LAST
+            LIMIT 12
+            """,
+            (batch_id,),
+        )
     if not industry_rows:
         industry_rows = rows(
             """
@@ -672,6 +809,8 @@ def process_upload(stored_path: Path, original_filename: str, uploaded_at: datet
                 "meta_json": (base.get("meta_json") or {}) | {"summary": workbook.summary, "position_rows": len(workbook.positions), "closed_rows": len(workbook.closed_positions), "transaction_rows": len(workbook.transactions), "akshare_enabled": AKSHARE_ENABLED, "errors": errors},
             })
             upsert_batch(conn, base)
+            rebuild_batch_summary(conn, batch_id)
+            refresh_summary_derived_fields(conn)
             conn.commit()
         report = build_report(base, previous_success(batch_id))
         execute("UPDATE portfolio_import_batches SET report_markdown = %s WHERE batch_id = %s", (report, batch_id))
@@ -683,7 +822,7 @@ def process_upload(stored_path: Path, original_filename: str, uploaded_at: datet
 
 
 def base_layout(title: str, body: str, user: str | None = None) -> str:
-    nav = "" if not user else "<nav><a href='/'>总览</a><a href='/timeline'>整体分析</a><a href='/uploads'>上传记录</a><a href='/api/logout'>退出</a></nav>"
+    nav = "" if not user else "<nav><a href='/'>总览</a><a href='/timeline'>整体分析</a><a href='/uploads'>上传记录</a><a href='/admin/data'>数据健康</a><a href='/api/logout'>退出</a></nav>"
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)} · {APP_TITLE}</title><style>{CSS}</style></head><body><header class="topbar"><a class="brand" href="/">{APP_TITLE}</a>{nav}</header><main>{body}</main></body></html>"""
 
 
@@ -734,11 +873,20 @@ def allocation_history(batch_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
     data = rows(
         """
         SELECT batch_id, allocation_bucket, amount, weight
-        FROM portfolio_asset_allocation
+        FROM portfolio_daily_allocation
         WHERE batch_id = ANY(%s)
         """,
         (batch_ids,),
     )
+    if not data:
+        data = rows(
+            """
+            SELECT batch_id, allocation_bucket, amount, weight
+            FROM portfolio_asset_allocation
+            WHERE batch_id = ANY(%s)
+            """,
+            (batch_ids,),
+        )
     by_batch = {batch_id: {} for batch_id in batch_ids}
     for item in data:
         by_batch.setdefault(item["batch_id"], {})[item["allocation_bucket"]] = item
@@ -750,61 +898,81 @@ def allocation_history(batch_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
 
 
 def analytics_timeline(months: int = 6) -> dict[str, Any]:
-    items = success_batches(500, months=months)
-    if not items:
-        return {"points": [], "series": {}, "allocation_history": {}, "risk": {}, "top_changes": [], "xray": None}
-    out: list[dict[str, Any]] = []
-    running_peak: float | None = None
-    max_drawdown = 0.0
-    consecutive_loss_days = 0
-    trailing_loss_streak = 0
-    previous: dict[str, Any] | None = None
-    for batch in items:
-        metrics = batch_metrics(batch["batch_id"])
-        pnl = one(
-            """
-            SELECT COALESCE(SUM(today_pnl), 0) AS today_pnl,
-                   COALESCE(SUM(holding_pnl), 0) AS holding_pnl,
-                   COALESCE(SUM(cumulative_pnl), 0) AS cumulative_pnl,
-                   MAX(portfolio_weight) AS max_position_weight
-            FROM portfolio_positions
-            WHERE batch_id = %s
-            """,
-            (batch["batch_id"],),
-        ) or {}
-        industry = industry_allocation(batch["batch_id"])
-        total_assets = as_float(batch.get("total_assets"))
-        running_peak = total_assets if running_peak is None else max(running_peak, total_assets)
-        drawdown = (total_assets / running_peak - 1) if running_peak else 0
-        max_drawdown = min(max_drawdown, drawdown)
-        if as_float(pnl.get("today_pnl")) < 0:
-            consecutive_loss_days += 1
-        else:
-            consecutive_loss_days = 0
-        trailing_loss_streak = consecutive_loss_days
-        out.append({
-            **batch,
-            "today_pnl": pnl.get("today_pnl"),
-            "holding_pnl": pnl.get("holding_pnl"),
-            "cumulative_pnl": pnl.get("cumulative_pnl"),
-            "total_assets_change": None if previous is None else total_assets - as_float(previous.get("total_assets")),
-            "position_count_change": None if previous is None else (batch.get("position_count") or 0) - (previous.get("position_count") or 0),
-            "top3_weight": metrics.get("top3_position_weight"),
-            "top5_weight": metrics.get("top5_position_weight"),
-            "top10_weight": metrics.get("top10_underlying_weight"),
-            "equity_like_weight": metrics.get("equity_like_weight"),
-            "bond_like_weight": metrics.get("bond_like_weight"),
-            "qdii_weight": metrics.get("qdii_weight"),
-            "cash_weight": metrics.get("cash_weight_estimated"),
-            "max_position_weight": pnl.get("max_position_weight"),
-            "max_industry_name": industry[0]["industry_name"] if industry else None,
-            "max_industry_weight": industry[0]["weight"] if industry else None,
-            "drawdown": drawdown,
-            "previous_batch_id": previous.get("batch_id") if previous else None,
-        })
-        previous = batch
+    latest = one("SELECT MAX(as_of_date) AS max_date FROM portfolio_daily_summary")
+    params: list[Any] = []
+    where = "WHERE true"
+    if months and latest and latest.get("max_date"):
+        where += " AND s.as_of_date >= %s"
+        params.append(latest["max_date"] - timedelta(days=max(1, months) * 31))
+    out = rows(
+        f"""
+        SELECT s.batch_id, s.uploaded_at, s.as_of_date, s.original_filename, s.status,
+               s.total_assets, s.total_assets_change, s.position_count, s.today_pnl,
+               s.holding_pnl, s.cumulative_pnl, s.max_position_weight,
+               s.top3_weight, s.top5_weight, s.top10_underlying_weight AS top10_weight,
+               s.equity_like_weight, s.bond_like_weight, s.qdii_weight, s.cash_weight,
+               s.max_industry_name, s.max_industry_weight, s.drawdown_estimated AS drawdown,
+               s.trailing_loss_streak,
+               LAG(s.batch_id) OVER (ORDER BY s.as_of_date, s.uploaded_at, s.batch_id) AS previous_batch_id
+        FROM portfolio_daily_summary s
+        JOIN portfolio_import_batches b ON b.batch_id = s.batch_id
+        {where} AND b.status IN ('complete', 'partial')
+        ORDER BY s.as_of_date ASC, s.uploaded_at ASC, s.batch_id ASC
+        LIMIT 500
+        """,
+        tuple(params),
+    )
+    if not out:
+        items = success_batches(500, months=months)
+        if not items:
+            return {"points": [], "series": {}, "allocation_history": {}, "risk": {}, "top_changes": [], "xray": None}
+        out = []
+        previous: dict[str, Any] | None = None
+        running_peak: float | None = None
+        trailing_loss_streak = 0
+        for batch in items:
+            metrics = batch_metrics(batch["batch_id"])
+            pnl = one(
+                """
+                SELECT COALESCE(SUM(today_pnl), 0) AS today_pnl,
+                       COALESCE(SUM(holding_pnl), 0) AS holding_pnl,
+                       COALESCE(SUM(cumulative_pnl), 0) AS cumulative_pnl,
+                       MAX(portfolio_weight) AS max_position_weight
+                FROM portfolio_positions
+                WHERE batch_id = %s
+                """,
+                (batch["batch_id"],),
+            ) or {}
+            industry = industry_allocation(batch["batch_id"])
+            total_assets = as_float(batch.get("total_assets"))
+            running_peak = total_assets if running_peak is None else max(running_peak, total_assets)
+            drawdown = (total_assets / running_peak - 1) if running_peak else 0
+            trailing_loss_streak = trailing_loss_streak + 1 if as_float(pnl.get("today_pnl")) < 0 else 0
+            out.append({
+                **batch,
+                "today_pnl": pnl.get("today_pnl"),
+                "holding_pnl": pnl.get("holding_pnl"),
+                "cumulative_pnl": pnl.get("cumulative_pnl"),
+                "total_assets_change": None if previous is None else total_assets - as_float(previous.get("total_assets")),
+                "top3_weight": metrics.get("top3_position_weight"),
+                "top5_weight": metrics.get("top5_position_weight"),
+                "top10_weight": metrics.get("top10_underlying_weight"),
+                "equity_like_weight": metrics.get("equity_like_weight"),
+                "bond_like_weight": metrics.get("bond_like_weight"),
+                "qdii_weight": metrics.get("qdii_weight"),
+                "cash_weight": metrics.get("cash_weight_estimated"),
+                "max_position_weight": pnl.get("max_position_weight"),
+                "max_industry_name": industry[0]["industry_name"] if industry else None,
+                "max_industry_weight": industry[0]["weight"] if industry else None,
+                "drawdown": drawdown,
+                "trailing_loss_streak": trailing_loss_streak,
+                "previous_batch_id": previous.get("batch_id") if previous else None,
+            })
+            previous = batch
     latest = out[-1]
     prev = out[-2] if len(out) > 1 else None
+    max_drawdown = min((as_float(item.get("drawdown")) for item in out), default=0.0)
+    trailing_loss_streak = int(latest.get("trailing_loss_streak") or 0)
     top_changes = compare_batches(prev["batch_id"], latest["batch_id"])["positions"] if prev else []
     return {
         "points": out,
@@ -1356,6 +1524,123 @@ async def replace_batch(batch_id: str, request: Request, file: UploadFile = File
         except OSError:
             pass
     return RedirectResponse(batch_link(result["batch_id"]), status_code=303)
+
+
+
+def table_counts() -> list[dict[str, Any]]:
+    names = [
+        "portfolio_import_batches",
+        "portfolio_positions",
+        "portfolio_transactions",
+        "portfolio_asset_allocation",
+        "portfolio_underlying_holdings",
+        "portfolio_daily_summary",
+        "portfolio_daily_allocation",
+        "portfolio_daily_exposure",
+    ]
+    return [
+        {"table": name, "rows": (one(f"SELECT COUNT(*) AS count FROM {name}") or {}).get("count", 0)}
+        for name in names
+    ]
+
+
+def directory_stats(path: Path) -> dict[str, Any]:
+    files = 0
+    bytes_used = 0
+    latest_mtime: float | None = None
+    if path.exists():
+        for item in path.rglob("*"):
+            if item.is_file():
+                files += 1
+                try:
+                    stat = item.stat()
+                except OSError:
+                    continue
+                bytes_used += stat.st_size
+                latest_mtime = stat.st_mtime if latest_mtime is None else max(latest_mtime, stat.st_mtime)
+    return {
+        "path": str(path),
+        "files": files,
+        "bytes": bytes_used,
+        "latest_mtime": datetime.fromtimestamp(latest_mtime, tz=timezone.utc) if latest_mtime else None,
+    }
+
+
+def data_health() -> dict[str, Any]:
+    batch_total = one("SELECT COUNT(*) AS count FROM portfolio_import_batches")["count"]
+    success_total = one("SELECT COUNT(*) AS count FROM portfolio_import_batches WHERE status IN ('complete', 'partial')")["count"]
+    summary_total = one(
+        """
+        SELECT COUNT(*) AS count
+        FROM portfolio_daily_summary s
+        JOIN portfolio_import_batches b ON b.batch_id = s.batch_id
+        WHERE b.status IN ('complete', 'partial')
+        """
+    )["count"]
+    missing = rows(
+        """
+        SELECT b.batch_id, b.as_of_date, b.original_filename
+        FROM portfolio_import_batches b
+        LEFT JOIN portfolio_daily_summary s ON s.batch_id = b.batch_id
+        WHERE b.status IN ('complete', 'partial') AND s.batch_id IS NULL
+        ORDER BY b.as_of_date DESC, b.uploaded_at DESC
+        LIMIT 20
+        """
+    )
+    upload_stats = directory_stats(UPLOAD_ROOT)
+    backup_stats = directory_stats(BACKUP_ROOT)
+    disk = shutil.disk_usage(UPLOAD_ROOT if UPLOAD_ROOT.exists() else UPLOAD_ROOT.parent)
+    return {
+        "batch_total": batch_total,
+        "success_total": success_total,
+        "summary_total": summary_total,
+        "summary_coverage": (summary_total / success_total) if success_total else 1,
+        "missing_summaries": missing,
+        "tables": table_counts(),
+        "uploads": upload_stats,
+        "backups": backup_stats,
+        "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
+    }
+
+
+def size_text(value: Any) -> str:
+    number = float(value or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if number < 1024 or unit == "TB":
+            return f"{number:.1f} {unit}" if unit != "B" else f"{number:.0f} B"
+        number /= 1024
+    return f"{number:.1f} TB"
+
+
+@app.get("/admin/data", response_class=HTMLResponse)
+def admin_data_page(request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    health = data_health()
+    table_rows = "".join(f"<tr><td>{esc(item['table'])}</td><td>{esc(item['rows'])}</td></tr>" for item in health["tables"])
+    missing_rows = "".join(
+        f"<tr><td><a href='{batch_link(item['batch_id'])}'>{esc(item['batch_id'])}</a></td><td>{fmt_date(item.get('as_of_date'))}</td><td>{esc(item.get('original_filename'))}</td></tr>"
+        for item in health["missing_summaries"]
+    ) or "<tr><td colspan='3' class='muted'>所有成功批次都有 summary</td></tr>"
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Data health</p><h1>数据健康</h1><p class='subtitle'>检查长期运行需要关心的批次、summary 覆盖率、文件和备份状态。</p></div></section><section class='metrics'><article><span>总批次</span><strong>{health['batch_total']}</strong></article><article><span>成功批次</span><strong>{health['success_total']}</strong></article><article><span>Summary 覆盖</span><strong>{pct(health['summary_coverage'])}</strong></article><article><span>上传文件</span><strong>{health['uploads']['files']}</strong></article><article><span>上传占用</span><strong>{size_text(health['uploads']['bytes'])}</strong></article><article><span>磁盘可用</span><strong>{size_text(health['disk']['free'])}</strong></article></section><section class='grid two'><article class='panel'><h2>表规模</h2><table><thead><tr><th>表</th><th>行数</th></tr></thead><tbody>{table_rows}</tbody></table></article><article class='panel'><h2>文件与备份</h2><table><tbody><tr><th>上传目录</th><td>{esc(health['uploads']['path'])}</td></tr><tr><th>最近上传文件时间</th><td>{fmt_dt(health['uploads']['latest_mtime'])}</td></tr><tr><th>备份目录</th><td>{esc(health['backups']['path'])}</td></tr><tr><th>备份文件数</th><td>{esc(health['backups']['files'])}</td></tr><tr><th>最近备份时间</th><td>{fmt_dt(health['backups']['latest_mtime'])}</td></tr><tr><th>备份占用</th><td>{size_text(health['backups']['bytes'])}</td></tr></tbody></table></article></section><section class='panel'><div class='section-head'><h2>缺失 Summary 的批次</h2><form class='inline-form' action='/admin/data/rebuild-summaries' method='post'><button type='submit'>重建 Summary</button></form></div><table><thead><tr><th>批次</th><th>日期</th><th>文件</th></tr></thead><tbody>{missing_rows}</tbody></table></section>"
+    return HTMLResponse(base_layout("数据健康", body, session_user(request)))
+
+
+@app.post("/admin/data/rebuild-summaries")
+def rebuild_summaries_page(request: Request):
+    require_user(request)
+    with db_conn() as conn:
+        count = rebuild_all_summaries(conn)
+        conn.commit()
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Rebuild complete</p><h1>Summary 已重建</h1><p class='subtitle'>已重建 {count} 个成功批次的长期分析汇总。</p></div></section><div class='actions'><a href='/admin/data'>返回数据健康</a><a href='/timeline'>查看趋势</a></div>"
+    return HTMLResponse(base_layout("Summary 已重建", body, session_user(request)))
+
+
+@app.get("/api/admin/data-health")
+def api_data_health(request: Request):
+    require_user(request)
+    return json_ready({"ok": True, **data_health()})
 
 
 @app.get("/api/health")

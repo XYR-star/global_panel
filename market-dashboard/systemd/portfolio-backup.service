@@ -1,0 +1,8 @@
+[Unit]
+Description=Ricky Portfolio database and upload backup
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/global_panel/market-dashboard/scripts/backup_portfolio.sh

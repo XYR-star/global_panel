@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Ricky Portfolio backup
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+Unit=portfolio-backup.service
+
+[Install]
+WantedBy=timers.target

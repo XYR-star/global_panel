@@ -12,6 +12,8 @@ This repository used to contain a Grafana-style market dashboard. That stack has
 - Keeps every accepted file as an independent historical batch.
 - Lets an existing batch be replaced when an upload was incomplete or wrong.
 - Shows the latest effective portfolio by holding date, not by raw upload order.
+- Maintains summary tables for long-term trend queries, so future hundreds/thousands of uploads do not require rescanning raw holdings every page load.
+- Includes a login-protected data health page for row counts, summary coverage, storage usage, and backup status.
 - Provides report pages, adjacent-batch comparison, trend cockpit, X-Ray style lookthrough, and monthly file management.
 - Protects all portfolio data behind login and temporary lockout after repeated failed login attempts.
 
@@ -30,6 +32,7 @@ This repository used to contain a Grafana-style market dashboard. That stack has
 - `/` — latest portfolio overview, upload form, core metrics, allocation bars, latest report excerpt, major holdings.
 - `/timeline` — trend cockpit across accepted historical files.
 - `/uploads` — monthly paged file management with filters and replacement controls.
+- `/admin/data` — data health, summary coverage, storage, and backup status.
 - `/reports/{batch_id}` — full report for a single upload batch.
 - `/compare?from=...&to=...` — position and risk changes between two batches.
 
@@ -85,6 +88,7 @@ All APIs except health require login.
 - `GET /api/portfolio/{batch_id}` — batch report data as JSON.
 - `GET /api/analytics/timeline?months=6` — trend cockpit data.
 - `GET /api/analytics/xray?batch_id=...` — lookthrough/X-Ray data.
+- `GET /api/admin/data-health` — login-protected operational health and storage summary.
 
 ## Data Model
 
@@ -98,6 +102,9 @@ Important tables:
 - `portfolio_risk_metrics` — deterministic concentration and exposure metrics.
 - `portfolio_underlying_holdings` — lookthrough/proxy underlying holdings.
 - `portfolio_industry_allocations` — industry/theme exposure.
+- `portfolio_daily_summary` — one row per successful/partial batch for fast long-term trend queries.
+- `portfolio_daily_allocation` — cached asset bucket time series.
+- `portfolio_daily_exposure` — cached X-Ray/industry exposure summaries.
 - `portfolio_login_failures` — login lockout tracking.
 
 ## Runtime Data
@@ -106,6 +113,7 @@ These paths are deployment examples and should not be committed with real data:
 
 - PostgreSQL volume: `/www/market-dashboard-data/postgres`
 - Uploaded files: `/var/lib/portfolio-app/uploads`
+- Local backups: `/var/lib/portfolio-app/backups`
 - Environment file: `.env.deploy` or `.env`
 
 Both `.env` and `.env.deploy` are ignored by Git.
@@ -128,6 +136,8 @@ PORTFOLIO_AKSHARE_ENABLED=false
 PORTFOLIO_MAX_UPLOAD_BYTES=26214400
 PORTFOLIO_LOGIN_FAILURE_LIMIT=5
 PORTFOLIO_LOGIN_LOCKOUT_MINUTES=30
+PORTFOLIO_BACKUP_ROOT=/var/lib/portfolio-app/backups
+PORTFOLIO_BACKUP_RETENTION_DAYS=30
 ```
 
 Do not commit real passwords, cookies, uploaded files, or portfolio exports.
@@ -139,8 +149,26 @@ docker compose --env-file .env.deploy ps
 docker compose --env-file .env.deploy up -d --build
 docker compose --env-file .env.deploy logs --tail=100 portfolio-app
 docker compose --env-file .env.deploy restart portfolio-app
+python3 scripts/rebuild_summaries.py
+scripts/backup_portfolio.sh
 docker compose --env-file .env.deploy exec postgres psql -U market -d market
 ```
+
+## Long-Term Data Operations
+
+The app keeps raw normalized tables for reports and cached summary tables for fast dashboards:
+
+- Run `python3 scripts/rebuild_summaries.py` after manual database repairs or historical imports.
+- `/admin/data` shows whether every successful batch has a summary row.
+- `scripts/backup_portfolio.sh` creates a compressed PostgreSQL dump and upload-directory archive.
+- The systemd units in `systemd/` run the backup daily at 03:20 server time when installed.
+
+Restore outline:
+
+1. Stop `portfolio-app`.
+2. Restore the PostgreSQL dump into the configured database.
+3. Restore the upload archive under the configured upload root.
+4. Start `portfolio-app`, then run `python3 scripts/rebuild_summaries.py` if summary rows need refreshing.
 
 ## Validation Checklist
 

@@ -109,6 +109,9 @@ def insert_import_batch(conn, batch_id: str, excel_path: Path, as_of_date: date,
 
 def clear_batch(conn, batch_id: str):
     tables = (
+        "portfolio_daily_exposure",
+        "portfolio_daily_allocation",
+        "portfolio_daily_summary",
         "portfolio_risk_metrics",
         "portfolio_asset_allocation",
         "portfolio_industry_allocations",
@@ -444,6 +447,311 @@ def insert_risk_metrics(conn, batch_id: str, as_of_date: date, rows: list[dict[s
             )
 
 
+
+def _metric_map(conn, batch_id: str) -> dict[str, float | None]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT metric_name, metric_value
+            FROM portfolio_risk_metrics
+            WHERE batch_id = %s AND metric_scope = 'portfolio'
+            """,
+            (batch_id,),
+        )
+        return {name: value for name, value in cur.fetchall()}
+
+
+def _first_row(conn, sql: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        if cur.description is None:
+            return None
+        columns = [col.name for col in cur.description]
+        row = cur.fetchone()
+        return dict(zip(columns, row)) if row else None
+
+
+def _many_rows(conn, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        columns = [col.name for col in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def rebuild_batch_summary(conn, batch_id: str) -> None:
+    batch = _first_row(
+        conn,
+        """
+        SELECT batch_id, as_of_date, uploaded_at, original_filename, status, total_assets, position_count
+        FROM portfolio_import_batches
+        WHERE batch_id = %s
+        """,
+        (batch_id,),
+    )
+    if not batch:
+        raise ValueError(f"Batch not found: {batch_id}")
+
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM portfolio_daily_exposure WHERE batch_id = %s", (batch_id,))
+        cur.execute("DELETE FROM portfolio_daily_allocation WHERE batch_id = %s", (batch_id,))
+        cur.execute("DELETE FROM portfolio_daily_summary WHERE batch_id = %s", (batch_id,))
+
+    if batch["status"] not in {"complete", "partial"}:
+        return
+
+    pnl = _first_row(
+        conn,
+        """
+        SELECT COALESCE(SUM(today_pnl), 0) AS today_pnl,
+               COALESCE(SUM(holding_pnl), 0) AS holding_pnl,
+               COALESCE(SUM(cumulative_pnl), 0) AS cumulative_pnl,
+               MAX(portfolio_weight) AS max_position_weight
+        FROM portfolio_positions
+        WHERE batch_id = %s
+        """,
+        (batch_id,),
+    ) or {}
+    metrics = _metric_map(conn, batch_id)
+    industry = _first_row(
+        conn,
+        """
+        SELECT industry_name, SUM(lookthrough_portfolio_weight) AS weight
+        FROM portfolio_industry_allocations
+        WHERE batch_id = %s
+        GROUP BY industry_name
+        ORDER BY weight DESC NULLS LAST
+        LIMIT 1
+        """,
+        (batch_id,),
+    )
+    if not industry:
+        industry = _first_row(
+            conn,
+            """
+            SELECT COALESCE(NULLIF(related_sector, ''), security_type, 'unknown') AS industry_name,
+                   SUM(COALESCE(portfolio_weight, 0)) AS weight
+            FROM portfolio_positions
+            WHERE batch_id = %s
+            GROUP BY COALESCE(NULLIF(related_sector, ''), security_type, 'unknown')
+            ORDER BY weight DESC
+            LIMIT 1
+            """,
+            (batch_id,),
+        )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO portfolio_daily_summary
+                (batch_id, as_of_date, uploaded_at, original_filename, status, total_assets,
+                 position_count, today_pnl, holding_pnl, cumulative_pnl, max_position_weight,
+                 top3_weight, top5_weight, top10_underlying_weight, equity_like_weight,
+                 bond_like_weight, qdii_weight, cash_weight, max_industry_name, max_industry_weight)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (batch_id) DO UPDATE SET
+                as_of_date = EXCLUDED.as_of_date,
+                uploaded_at = EXCLUDED.uploaded_at,
+                original_filename = EXCLUDED.original_filename,
+                status = EXCLUDED.status,
+                total_assets = EXCLUDED.total_assets,
+                position_count = EXCLUDED.position_count,
+                today_pnl = EXCLUDED.today_pnl,
+                holding_pnl = EXCLUDED.holding_pnl,
+                cumulative_pnl = EXCLUDED.cumulative_pnl,
+                max_position_weight = EXCLUDED.max_position_weight,
+                top3_weight = EXCLUDED.top3_weight,
+                top5_weight = EXCLUDED.top5_weight,
+                top10_underlying_weight = EXCLUDED.top10_underlying_weight,
+                equity_like_weight = EXCLUDED.equity_like_weight,
+                bond_like_weight = EXCLUDED.bond_like_weight,
+                qdii_weight = EXCLUDED.qdii_weight,
+                cash_weight = EXCLUDED.cash_weight,
+                max_industry_name = EXCLUDED.max_industry_name,
+                max_industry_weight = EXCLUDED.max_industry_weight,
+                updated_at = NOW()
+            """,
+            (
+                batch_id,
+                batch["as_of_date"],
+                batch["uploaded_at"],
+                batch["original_filename"],
+                batch["status"],
+                batch["total_assets"],
+                batch["position_count"],
+                pnl.get("today_pnl"),
+                pnl.get("holding_pnl"),
+                pnl.get("cumulative_pnl"),
+                pnl.get("max_position_weight"),
+                metrics.get("top3_position_weight"),
+                metrics.get("top5_position_weight"),
+                metrics.get("top10_underlying_weight"),
+                metrics.get("equity_like_weight"),
+                metrics.get("bond_like_weight"),
+                metrics.get("qdii_weight"),
+                metrics.get("cash_weight_estimated"),
+                industry.get("industry_name") if industry else None,
+                industry.get("weight") if industry else None,
+            ),
+        )
+
+        cur.execute(
+            """
+            INSERT INTO portfolio_daily_allocation
+                (batch_id, as_of_date, allocation_bucket, amount, weight, source)
+            SELECT batch_id, as_of_date, allocation_bucket, amount, weight, source
+            FROM portfolio_asset_allocation
+            WHERE batch_id = %s
+            ON CONFLICT (batch_id, allocation_bucket) DO UPDATE SET
+                as_of_date = EXCLUDED.as_of_date,
+                amount = EXCLUDED.amount,
+                weight = EXCLUDED.weight,
+                source = EXCLUDED.source,
+                updated_at = NOW()
+            """,
+            (batch_id,),
+        )
+
+        cur.execute(
+            """
+            INSERT INTO portfolio_daily_exposure
+                (batch_id, as_of_date, exposure_type, exposure_code, exposure_name, amount, weight, source_count, contributors, source)
+            SELECT batch_id,
+                   MIN(as_of_date) AS as_of_date,
+                   'underlying' AS exposure_type,
+                   underlying_code AS exposure_code,
+                   underlying_name AS exposure_name,
+                   SUM(lookthrough_amount) AS amount,
+                   SUM(lookthrough_portfolio_weight) AS weight,
+                   COUNT(DISTINCT parent_code) AS source_count,
+                   jsonb_agg(jsonb_build_object('parent_code', parent_code, 'parent_name', parent_name, 'weight', lookthrough_portfolio_weight)
+                             ORDER BY lookthrough_portfolio_weight DESC) AS contributors,
+                   'computed' AS source
+            FROM portfolio_underlying_holdings
+            WHERE batch_id = %s
+            GROUP BY batch_id, underlying_code, underlying_name
+            ON CONFLICT (batch_id, exposure_type, exposure_code, exposure_name) DO UPDATE SET
+                amount = EXCLUDED.amount,
+                weight = EXCLUDED.weight,
+                source_count = EXCLUDED.source_count,
+                contributors = EXCLUDED.contributors,
+                updated_at = NOW()
+            """,
+            (batch_id,),
+        )
+
+        cur.execute(
+            """
+            INSERT INTO portfolio_daily_exposure
+                (batch_id, as_of_date, exposure_type, exposure_code, exposure_name, amount, weight, source_count, contributors, source)
+            SELECT batch_id,
+                   MIN(as_of_date) AS as_of_date,
+                   'industry' AS exposure_type,
+                   '' AS exposure_code,
+                   industry_name AS exposure_name,
+                   NULL AS amount,
+                   SUM(lookthrough_portfolio_weight) AS weight,
+                   COUNT(DISTINCT parent_code) AS source_count,
+                   jsonb_agg(jsonb_build_object('parent_code', parent_code, 'parent_name', parent_name, 'weight', lookthrough_portfolio_weight)
+                             ORDER BY lookthrough_portfolio_weight DESC) AS contributors,
+                   'computed' AS source
+            FROM portfolio_industry_allocations
+            WHERE batch_id = %s
+            GROUP BY batch_id, industry_name
+            ON CONFLICT (batch_id, exposure_type, exposure_code, exposure_name) DO UPDATE SET
+                weight = EXCLUDED.weight,
+                source_count = EXCLUDED.source_count,
+                contributors = EXCLUDED.contributors,
+                updated_at = NOW()
+            """,
+            (batch_id,),
+        )
+
+        cur.execute(
+            """
+            INSERT INTO portfolio_daily_exposure
+                (batch_id, as_of_date, exposure_type, exposure_code, exposure_name, amount, weight, source_count, contributors, source)
+            SELECT batch_id,
+                   MIN(as_of_date) AS as_of_date,
+                   'industry' AS exposure_type,
+                   '' AS exposure_code,
+                   COALESCE(NULLIF(related_sector, ''), security_type, 'unknown') AS exposure_name,
+                   NULL AS amount,
+                   SUM(COALESCE(portfolio_weight, 0)) AS weight,
+                   COUNT(*) AS source_count,
+                   jsonb_agg(jsonb_build_object('parent_code', security_code, 'parent_name', security_name, 'weight', portfolio_weight)
+                             ORDER BY portfolio_weight DESC) AS contributors,
+                   'fallback' AS source
+            FROM portfolio_positions p
+            WHERE batch_id = %s
+              AND NOT EXISTS (SELECT 1 FROM portfolio_daily_exposure e WHERE e.batch_id = p.batch_id AND e.exposure_type = 'industry')
+            GROUP BY batch_id, COALESCE(NULLIF(related_sector, ''), security_type, 'unknown')
+            ON CONFLICT (batch_id, exposure_type, exposure_code, exposure_name) DO UPDATE SET
+                weight = EXCLUDED.weight,
+                source_count = EXCLUDED.source_count,
+                contributors = EXCLUDED.contributors,
+                source = EXCLUDED.source,
+                updated_at = NOW()
+            """,
+            (batch_id,),
+        )
+
+
+def refresh_summary_derived_fields(conn) -> None:
+    items = _many_rows(
+        conn,
+        """
+        SELECT s.batch_id, s.total_assets, s.today_pnl,
+               LAG(s.total_assets) OVER (ORDER BY s.as_of_date, s.uploaded_at, s.batch_id) AS previous_assets
+        FROM portfolio_daily_summary s
+        JOIN portfolio_import_batches b ON b.batch_id = s.batch_id
+        WHERE b.status IN ('complete', 'partial')
+        ORDER BY s.as_of_date, s.uploaded_at, s.batch_id
+        """,
+    )
+    running_peak: float | None = None
+    trailing_loss_streak = 0
+    with conn.cursor() as cur:
+        for item in items:
+            total_assets = float(item["total_assets"] or 0)
+            running_peak = total_assets if running_peak is None else max(running_peak, total_assets)
+            drawdown = (total_assets / running_peak - 1) if running_peak else 0
+            if float(item["today_pnl"] or 0) < 0:
+                trailing_loss_streak += 1
+            else:
+                trailing_loss_streak = 0
+            previous_assets = item.get("previous_assets")
+            total_assets_change = None if previous_assets is None else total_assets - float(previous_assets or 0)
+            cur.execute(
+                """
+                UPDATE portfolio_daily_summary
+                SET total_assets_change = %s,
+                    drawdown_estimated = %s,
+                    trailing_loss_streak = %s,
+                    updated_at = NOW()
+                WHERE batch_id = %s
+                """,
+                (total_assets_change, drawdown, trailing_loss_streak, item["batch_id"]),
+            )
+
+
+def rebuild_all_summaries(conn) -> int:
+    batch_ids = [
+        row["batch_id"]
+        for row in _many_rows(
+            conn,
+            """
+            SELECT batch_id
+            FROM portfolio_import_batches
+            WHERE status IN ('complete', 'partial')
+            ORDER BY as_of_date, uploaded_at, batch_id
+            """,
+        )
+    ]
+    for batch_id in batch_ids:
+        rebuild_batch_summary(conn, batch_id)
+    refresh_summary_derived_fields(conn)
+    return len(batch_ids)
+
 def enrich_positions(positions: list[dict[str, Any]], catalog: set[str]) -> list[dict[str, Any]]:
     enriched = []
     for row in positions:
@@ -606,6 +914,8 @@ def main() -> int:
         risk_metrics = portfolio.compute_risk_metrics(positions, underlying_rows, metadata_rows)
         insert_allocations(conn, batch_id, as_of_date, allocations)
         insert_risk_metrics(conn, batch_id, as_of_date, risk_metrics)
+        rebuild_batch_summary(conn, batch_id)
+        refresh_summary_derived_fields(conn)
 
         summary_amount = portfolio.to_decimal(workbook.summary.get("持有金额"))
         position_amount = sum((portfolio.to_decimal(row.get("持有金额")) or 0 for row in positions), 0)

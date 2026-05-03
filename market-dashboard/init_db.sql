@@ -224,6 +224,83 @@ CREATE INDEX IF NOT EXISTS idx_portfolio_risk_metrics_asof
     ON portfolio_risk_metrics (as_of_date, metric_scope, metric_name);
 
 
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_batches_asof_uploaded
+    ON portfolio_import_batches (as_of_date DESC, uploaded_at DESC, batch_id DESC)
+    WHERE status IN ('complete', 'partial');
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_positions_security_asof
+    ON portfolio_positions (security_code, as_of_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_transactions_batch_date
+    ON portfolio_transactions (batch_id, trade_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_asset_allocation_bucket_asof
+    ON portfolio_asset_allocation (allocation_bucket, as_of_date);
+
+CREATE TABLE IF NOT EXISTS portfolio_daily_summary (
+    batch_id TEXT PRIMARY KEY REFERENCES portfolio_import_batches(batch_id) ON DELETE CASCADE,
+    as_of_date DATE NOT NULL,
+    uploaded_at TIMESTAMPTZ NOT NULL,
+    original_filename TEXT,
+    status TEXT NOT NULL,
+    total_assets NUMERIC(20, 6),
+    total_assets_change NUMERIC(20, 6),
+    position_count INTEGER NOT NULL DEFAULT 0,
+    today_pnl NUMERIC(20, 6),
+    holding_pnl NUMERIC(20, 6),
+    cumulative_pnl NUMERIC(20, 6),
+    max_position_weight DOUBLE PRECISION,
+    top3_weight DOUBLE PRECISION,
+    top5_weight DOUBLE PRECISION,
+    top10_underlying_weight DOUBLE PRECISION,
+    equity_like_weight DOUBLE PRECISION,
+    bond_like_weight DOUBLE PRECISION,
+    qdii_weight DOUBLE PRECISION,
+    cash_weight DOUBLE PRECISION,
+    max_industry_name TEXT,
+    max_industry_weight DOUBLE PRECISION,
+    drawdown_estimated DOUBLE PRECISION,
+    trailing_loss_streak INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'computed',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_daily_summary_asof_uploaded
+    ON portfolio_daily_summary (as_of_date DESC, uploaded_at DESC, batch_id DESC);
+
+CREATE TABLE IF NOT EXISTS portfolio_daily_allocation (
+    batch_id TEXT NOT NULL REFERENCES portfolio_import_batches(batch_id) ON DELETE CASCADE,
+    as_of_date DATE NOT NULL,
+    allocation_bucket TEXT NOT NULL,
+    amount NUMERIC(20, 6) NOT NULL DEFAULT 0,
+    weight DOUBLE PRECISION NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'computed',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (batch_id, allocation_bucket)
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_daily_allocation_bucket_asof
+    ON portfolio_daily_allocation (allocation_bucket, as_of_date);
+
+CREATE TABLE IF NOT EXISTS portfolio_daily_exposure (
+    batch_id TEXT NOT NULL REFERENCES portfolio_import_batches(batch_id) ON DELETE CASCADE,
+    as_of_date DATE NOT NULL,
+    exposure_type TEXT NOT NULL,
+    exposure_code TEXT NOT NULL DEFAULT '',
+    exposure_name TEXT NOT NULL,
+    amount NUMERIC(20, 6),
+    weight DOUBLE PRECISION,
+    source_count INTEGER NOT NULL DEFAULT 1,
+    contributors JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source TEXT NOT NULL DEFAULT 'computed',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (batch_id, exposure_type, exposure_code, exposure_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_daily_exposure_type_weight
+    ON portfolio_daily_exposure (batch_id, exposure_type, weight DESC);
+
 CREATE TABLE IF NOT EXISTS portfolio_login_failures (
     failure_key TEXT PRIMARY KEY,
     username TEXT NOT NULL,
