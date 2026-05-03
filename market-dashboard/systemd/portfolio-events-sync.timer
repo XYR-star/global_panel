@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Ricky Portfolio announcement event sync
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+Persistent=true
+Unit=portfolio-events-sync.service
+
+[Install]
+WantedBy=timers.target

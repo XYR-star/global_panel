@@ -223,6 +223,112 @@ CREATE TABLE IF NOT EXISTS portfolio_risk_metrics (
 CREATE INDEX IF NOT EXISTS idx_portfolio_risk_metrics_asof
     ON portfolio_risk_metrics (as_of_date, metric_scope, metric_name);
 
+CREATE TABLE IF NOT EXISTS portfolio_data_sources (
+    source_key TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    fetch_days INTEGER NOT NULL DEFAULT 7,
+    public_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    encrypted_secret TEXT,
+    last_sync_at TIMESTAMPTZ,
+    last_sync_status TEXT,
+    last_sync_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_events (
+    event_id BIGSERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    announcement_date DATE NOT NULL,
+    source_key TEXT NOT NULL,
+    source_event_id TEXT,
+    source_url TEXT,
+    pdf_url TEXT,
+    event_type TEXT NOT NULL DEFAULT '公告',
+    importance INTEGER NOT NULL DEFAULT 3,
+    dedupe_hash TEXT NOT NULL UNIQUE,
+    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_events_date_source
+    ON portfolio_events (announcement_date DESC, source_key);
+CREATE INDEX IF NOT EXISTS idx_portfolio_events_type
+    ON portfolio_events (event_type);
+
+CREATE TABLE IF NOT EXISTS portfolio_event_symbols (
+    event_id BIGINT NOT NULL REFERENCES portfolio_events(event_id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL,
+    symbol_name TEXT,
+    security_type TEXT,
+    market TEXT,
+    batch_id TEXT REFERENCES portfolio_import_batches(batch_id) ON DELETE SET NULL,
+    as_of_date DATE,
+    relation_type TEXT NOT NULL DEFAULT 'holding',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_event_symbols_unique
+    ON portfolio_event_symbols (event_id, symbol, COALESCE(batch_id, ''));
+CREATE INDEX IF NOT EXISTS idx_portfolio_event_symbols_symbol
+    ON portfolio_event_symbols (symbol, event_id DESC);
+CREATE INDEX IF NOT EXISTS idx_portfolio_event_symbols_batch
+    ON portfolio_event_symbols (batch_id, event_id DESC);
+
+CREATE TABLE IF NOT EXISTS portfolio_event_fetch_runs (
+    run_id BIGSERIAL PRIMARY KEY,
+    source_key TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    status TEXT NOT NULL DEFAULT 'running',
+    fetch_days INTEGER NOT NULL DEFAULT 7,
+    watchlist_count INTEGER NOT NULL DEFAULT 0,
+    fetched_count INTEGER NOT NULL DEFAULT 0,
+    inserted_count INTEGER NOT NULL DEFAULT 0,
+    duplicate_count INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_event_fetch_runs_started
+    ON portfolio_event_fetch_runs (started_at DESC);
+
+CREATE TABLE IF NOT EXISTS portfolio_event_reads (
+    event_id BIGINT PRIMARY KEY REFERENCES portfolio_events(event_id) ON DELETE CASCADE,
+    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+    is_favorite BOOLEAN NOT NULL DEFAULT FALSE,
+    is_ignored BOOLEAN NOT NULL DEFAULT FALSE,
+    read_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_ai_settings (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    provider TEXT NOT NULL DEFAULT 'none',
+    model TEXT,
+    daily_limit INTEGER NOT NULL DEFAULT 30,
+    public_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    encrypted_api_key TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT portfolio_ai_settings_singleton CHECK (id = 1)
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_event_ai_insights (
+    event_id BIGINT PRIMARY KEY REFERENCES portfolio_events(event_id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    model TEXT,
+    summary TEXT NOT NULL,
+    event_type TEXT NOT NULL DEFAULT '公告',
+    importance INTEGER NOT NULL DEFAULT 3,
+    relevance TEXT NOT NULL DEFAULT '',
+    risks JSONB NOT NULL DEFAULT '[]'::jsonb,
+    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 
 
 CREATE INDEX IF NOT EXISTS idx_portfolio_batches_asof_uploaded

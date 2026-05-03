@@ -15,6 +15,7 @@ This repository used to contain a Grafana-style market dashboard. That stack has
 - Maintains summary tables for long-term trend queries, so future hundreds/thousands of uploads do not require rescanning raw holdings every page load.
 - Includes a login-protected data health page for row counts, summary coverage, storage usage, and backup status.
 - Provides report pages, adjacent-batch comparison, trend cockpit, X-Ray style lookthrough, and monthly file management.
+- Provides a login-protected announcement event radar driven by the latest portfolio watchlist.
 - Protects all portfolio data behind login and temporary lockout after repeated failed login attempts.
 
 ## Tech Stack
@@ -32,6 +33,11 @@ This repository used to contain a Grafana-style market dashboard. That stack has
 - `/` — latest portfolio overview, upload form, core metrics, allocation bars, latest report excerpt, major holdings.
 - `/timeline` — trend cockpit across accepted historical files.
 - `/uploads` — monthly paged file management with filters and replacement controls.
+- `/events` — portfolio-driven announcement radar.
+- `/events/funds` — domestic fund announcement list with source, symbol, type, date, and status filters.
+- `/events/us` — reserved overseas filing page; SEC EDGAR is disabled by default.
+- `/settings/data-sources` — announcement source settings.
+- `/settings/ai` — optional AI insight settings; disabled by default.
 - `/admin/data` — data health, summary coverage, storage, and backup status.
 - `/reports/{batch_id}` — full report for a single upload batch.
 - `/compare?from=...&to=...` — position and risk changes between two batches.
@@ -50,6 +56,19 @@ The timeline page uses accepted `complete` and `partial` batches ordered by `as_
 - Top position changes versus the previous accepted batch.
 
 No market benchmark or external price API is required for this first version.
+
+## Announcement Radar
+
+The event radar builds a watchlist from the latest successful portfolio batch, prioritizing funds, ETFs/LOFs, QDII, bond funds, and cash-like fund holdings. It syncs announcement sources, deduplicates by source id or normalized event hash, and stores the original/PDF URL without downloading PDFs.
+
+Default sources:
+
+- `fund_eid` — China Securities Regulatory Commission fund electronic disclosure site, enabled by default.
+- `cninfo` — CNINFO/Juchao announcements, enabled by default.
+- `tushare` — disabled by default; can be enabled with a token for structured enhancement.
+- `sec_edgar` — disabled placeholder for future overseas holdings.
+
+Events support read, favorite, and ignored state. AI insights are optional and only run against already-stored announcements.
 
 ## X-Ray / Lookthrough
 
@@ -89,6 +108,19 @@ All APIs except health require login.
 - `GET /api/analytics/timeline?months=6` — trend cockpit data.
 - `GET /api/analytics/xray?batch_id=...` — lookthrough/X-Ray data.
 - `GET /api/admin/data-health` — login-protected operational health and storage summary.
+- `GET /api/settings/data-sources` — data source settings; secrets are returned only as `configured`.
+- `POST /api/settings/data-sources/{source_key}` — enable/disable a source, update fetch days, or replace a secret.
+- `POST /api/settings/data-sources/{source_key}/test` — test a source adapter.
+- `GET /api/settings/ai` — AI settings; API keys are returned only as `configured`.
+- `POST /api/settings/ai` — update AI provider/model/limit/key.
+- `POST /api/settings/ai/test` — test the configured AI provider.
+- `POST /api/events/sync-now` — sync enabled announcement sources for the latest watchlist.
+- `GET /api/events?source=&symbol=&type=&status=&page=` — paged event list.
+- `GET /api/events/{event_id}` — event detail with symbols, read state, and cached AI insight.
+- `POST /api/events/{event_id}/read` — mark read/unread or ignored.
+- `POST /api/events/{event_id}/favorite` — mark favorite/unfavorite.
+- `POST /api/events/{event_id}/ignore` — mark ignored/unignored.
+- `POST /api/events/{event_id}/ai-insight` — generate or read cached AI insight.
 
 ## Data Model
 
@@ -106,6 +138,13 @@ Important tables:
 - `portfolio_daily_allocation` — cached asset bucket time series.
 - `portfolio_daily_exposure` — cached X-Ray/industry exposure summaries.
 - `portfolio_login_failures` — login lockout tracking.
+- `portfolio_data_sources` — announcement source settings and encrypted secrets.
+- `portfolio_events` — announcement event records.
+- `portfolio_event_symbols` — event-to-holding relationships.
+- `portfolio_event_fetch_runs` — sync run logs.
+- `portfolio_event_reads` — read, favorite, and ignored state.
+- `portfolio_ai_settings` — optional AI provider settings and encrypted key.
+- `portfolio_event_ai_insights` — cached AI summaries and risk highlights.
 
 ## Runtime Data
 
@@ -142,6 +181,8 @@ PORTFOLIO_BACKUP_RETENTION_DAYS=30
 
 Do not commit real passwords, cookies, uploaded files, or portfolio exports.
 
+Tushare, DeepSeek, and OpenAI keys should be entered through the settings pages. The app encrypts them with a key derived from `PORTFOLIO_SESSION_SECRET` and never returns the cleartext value through the API or HTML.
+
 ## Common Commands
 
 ```bash
@@ -150,6 +191,7 @@ docker compose --env-file .env.deploy up -d --build
 docker compose --env-file .env.deploy logs --tail=100 portfolio-app
 docker compose --env-file .env.deploy restart portfolio-app
 python3 scripts/rebuild_summaries.py
+python3 scripts/sync_events.py
 scripts/backup_portfolio.sh
 docker compose --env-file .env.deploy exec postgres psql -U market -d market
 ```
@@ -162,6 +204,7 @@ The app keeps raw normalized tables for reports and cached summary tables for fa
 - `/admin/data` shows whether every successful batch has a summary row.
 - `scripts/backup_portfolio.sh` creates a compressed PostgreSQL dump and upload-directory archive.
 - The systemd units in `systemd/` run the backup daily at 03:20 server time when installed.
+- `systemd/portfolio-events-sync.timer` runs announcement sync daily at 04:10 server time when installed.
 
 Restore outline:
 

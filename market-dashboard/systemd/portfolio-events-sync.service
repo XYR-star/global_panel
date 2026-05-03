@@ -1,0 +1,10 @@
+[Unit]
+Description=Ricky Portfolio announcement event sync
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/global_panel/market-dashboard
+EnvironmentFile=-/root/global_panel/market-dashboard/.env.deploy
+ExecStart=/usr/bin/docker compose --env-file /root/global_panel/market-dashboard/.env.deploy exec -T portfolio-app python3 scripts/sync_events.py

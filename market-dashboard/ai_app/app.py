@@ -12,12 +12,14 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from psycopg2.extras import Json, RealDictCursor
 
-from providers import portfolio
+from providers import ai_insights, portfolio
+from providers import events as event_provider
 from providers.store import connect_db, ensure_schema
 from sync_portfolio_data import (
     clear_batch,
@@ -191,6 +193,8 @@ def ensure_portfolio_schema() -> None:
 def startup() -> None:
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     ensure_portfolio_schema()
+    with db_conn() as conn:
+        event_provider.ensure_event_defaults(conn)
 
 
 def sign(value: str) -> str:
@@ -822,7 +826,7 @@ def process_upload(stored_path: Path, original_filename: str, uploaded_at: datet
 
 
 def base_layout(title: str, body: str, user: str | None = None) -> str:
-    nav = "" if not user else "<nav><a href='/'>总览</a><a href='/timeline'>整体分析</a><a href='/uploads'>上传记录</a><a href='/admin/data'>数据健康</a><a href='/api/logout'>退出</a></nav>"
+    nav = "" if not user else "<nav><a href='/'>总览</a><a href='/timeline'>整体分析</a><a href='/events'>公告雷达</a><a href='/uploads'>上传记录</a><a href='/settings/data-sources'>设置</a><a href='/admin/data'>数据健康</a><a href='/api/logout'>退出</a></nav>"
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)} · {APP_TITLE}</title><style>{CSS}</style></head><body><header class="topbar"><a class="brand" href="/">{APP_TITLE}</a>{nav}</header><main>{body}</main></body></html>"""
 
 
@@ -1145,6 +1149,227 @@ def upload_result_page(results: list[dict[str, Any]], skipped: list[dict[str, An
     return HTMLResponse(base_layout("上传结果", body, user))
 
 
+def event_filters(request: Request) -> dict[str, Any]:
+    page_text = request.query_params.get("page") or "1"
+    try:
+        page = max(1, int(page_text))
+    except ValueError:
+        page = 1
+    return {
+        "source": request.query_params.get("source") or "",
+        "symbol": request.query_params.get("symbol") or "",
+        "type": request.query_params.get("type") or "",
+        "status": request.query_params.get("status") or "",
+        "start": request.query_params.get("start") or "",
+        "end": request.query_params.get("end") or "",
+        "page": page,
+        "per_page": 30,
+    }
+
+
+def event_query(filters: dict[str, Any], funds_only: bool = False, latest_batch_only: bool = False, important_only: bool = False) -> dict[str, Any]:
+    where = ["true"]
+    params: list[Any] = []
+    if filters.get("source"):
+        where.append("e.source_key = %s")
+        params.append(filters["source"])
+    if filters.get("symbol"):
+        where.append("EXISTS (SELECT 1 FROM portfolio_event_symbols s WHERE s.event_id = e.event_id AND s.symbol = %s)")
+        params.append(str(filters["symbol"]).zfill(6))
+    if filters.get("type"):
+        where.append("e.event_type ILIKE %s")
+        params.append(f"%{filters['type']}%")
+    if filters.get("start"):
+        where.append("e.announcement_date >= %s")
+        params.append(filters["start"])
+    if filters.get("end"):
+        where.append("e.announcement_date <= %s")
+        params.append(filters["end"])
+    status = filters.get("status")
+    if status == "unread":
+        where.append("COALESCE(r.is_read, false) = false AND COALESCE(r.is_ignored, false) = false")
+    elif status == "read":
+        where.append("COALESCE(r.is_read, false) = true")
+    elif status == "favorite":
+        where.append("COALESCE(r.is_favorite, false) = true")
+    elif status == "ignored":
+        where.append("COALESCE(r.is_ignored, false) = true")
+    if funds_only:
+        where.append("EXISTS (SELECT 1 FROM portfolio_event_symbols s WHERE s.event_id = e.event_id AND s.security_type = ANY(%s))")
+        params.append(list(event_provider.FUND_SECURITY_TYPES))
+    if latest_batch_only:
+        batch = latest_batch()
+        if batch:
+            where.append("EXISTS (SELECT 1 FROM portfolio_event_symbols s WHERE s.event_id = e.event_id AND s.batch_id = %s)")
+            params.append(batch["batch_id"])
+    if important_only:
+        where.append("e.importance >= 3 AND COALESCE(r.is_read, false) = false AND COALESCE(r.is_ignored, false) = false")
+    where_sql = " AND ".join(where)
+    total = one(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM portfolio_events e
+        LEFT JOIN portfolio_event_reads r ON r.event_id = e.event_id
+        WHERE {where_sql}
+        """,
+        tuple(params),
+    )["count"]
+    offset = (filters["page"] - 1) * filters["per_page"]
+    data = rows(
+        f"""
+        SELECT e.*, COALESCE(r.is_read, false) AS is_read,
+               COALESCE(r.is_favorite, false) AS is_favorite,
+               COALESCE(r.is_ignored, false) AS is_ignored,
+               string_agg(DISTINCT s.symbol, ', ' ORDER BY s.symbol) AS symbols,
+               string_agg(DISTINCT s.symbol_name, ', ' ORDER BY s.symbol_name) AS symbol_names
+        FROM portfolio_events e
+        LEFT JOIN portfolio_event_reads r ON r.event_id = e.event_id
+        LEFT JOIN portfolio_event_symbols s ON s.event_id = e.event_id
+        WHERE {where_sql}
+        GROUP BY e.event_id, r.is_read, r.is_favorite, r.is_ignored
+        ORDER BY e.announcement_date DESC, e.event_id DESC
+        LIMIT %s OFFSET %s
+        """,
+        tuple(params + [filters["per_page"], offset]),
+    )
+    return {"events": data, "total": total, "filters": filters}
+
+
+def event_table(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "<p class='muted'>暂无公告</p>"
+    body = "".join(
+        f"<tr class='event-row {'is-read' if item.get('is_read') else ''}'><td>{fmt_date(item.get('announcement_date'))}</td><td><a href='/events/{item['event_id']}'>{esc(item.get('title'))}</a></td><td>{esc(item.get('symbols') or '')}</td><td>{esc(item.get('source_key'))}</td><td>{esc(item.get('event_type'))}</td><td>{esc(item.get('importance'))}</td><td>{'★' if item.get('is_favorite') else ''}{' 已读' if item.get('is_read') else ''}{' 忽略' if item.get('is_ignored') else ''}</td></tr>"
+        for item in items
+    )
+    return f"<div class='table-wrap'><table><thead><tr><th>日期</th><th>标题</th><th>代码</th><th>来源</th><th>类型</th><th>重要性</th><th>状态</th></tr></thead><tbody>{body}</tbody></table></div>"
+
+
+def event_filter_form(filters: dict[str, Any], action: str) -> str:
+    status_options = "".join(
+        f"<option value='{value}' {'selected' if filters.get('status') == value else ''}>{label}</option>"
+        for value, label in [("", "全部状态"), ("unread", "未读"), ("read", "已读"), ("favorite", "收藏"), ("ignored", "忽略")]
+    )
+    source_options = "".join(
+        f"<option value='{value}' {'selected' if filters.get('source') == value else ''}>{label}</option>"
+        for value, label in [("", "全部来源"), ("fund_eid", "证监会基金电子披露"), ("cninfo", "巨潮资讯"), ("tushare", "Tushare"), ("sec_edgar", "SEC EDGAR")]
+    )
+    return f"<form class='filters' method='get' action='{action}'><label>来源<select name='source'>{source_options}</select></label><label>代码<input name='symbol' value='{esc(filters.get('symbol'))}'></label><label>类型<input name='type' value='{esc(filters.get('type'))}'></label><label>状态<select name='status'>{status_options}</select></label><label>开始<input type='date' name='start' value='{esc(filters.get('start'))}'></label><label>结束<input type='date' name='end' value='{esc(filters.get('end'))}'></label><button type='submit'>筛选</button></form>"
+
+
+def event_detail(event_id: int) -> dict[str, Any]:
+    event = one("SELECT * FROM portfolio_events WHERE event_id = %s", (event_id,))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    symbols = rows("SELECT * FROM portfolio_event_symbols WHERE event_id = %s ORDER BY symbol", (event_id,))
+    state = one("SELECT * FROM portfolio_event_reads WHERE event_id = %s", (event_id,)) or {"is_read": False, "is_favorite": False, "is_ignored": False}
+    insight = one("SELECT * FROM portfolio_event_ai_insights WHERE event_id = %s", (event_id,))
+    return {"event": event, "symbols": symbols, "state": state, "insight": insight}
+
+
+async def request_payload(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            return dict(await request.json())
+        except json.JSONDecodeError:
+            return {}
+    form = await request.form()
+    return dict(form)
+
+
+def bool_value(value: Any, default: bool | None = None) -> bool | None:
+    if value is None or value == "":
+        return default
+    return str(value).lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def is_html_form(request: Request) -> bool:
+    content_type = request.headers.get("content-type", "")
+    return "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type
+
+
+@app.get("/events", response_class=HTMLResponse)
+def events_page(request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    filters = event_filters(request)
+    result = event_query(filters, latest_batch_only=False)
+    pages = max(1, (int(result["total"]) + filters["per_page"] - 1) // filters["per_page"])
+    query = urlencode({key: value for key, value in filters.items() if key not in {"page", "per_page"} and value})
+    pager = f"<div class='pager'><a href='/events?{query}&page={max(1, filters['page'] - 1)}'>上一页</a><span>{filters['page']} / {pages}</span><a href='/events?{query}&page={min(pages, filters['page'] + 1)}'>下一页</a></div>"
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Event radar</p><h1>公告雷达</h1><p class='subtitle'>按持仓代码汇总公告，支持手动同步、筛选、已读、收藏和 AI 解读。</p></div></section><div class='actions'><a href='/events/funds'>国内基金公告</a><a href='/events/us'>美股/海外预留</a><a href='/settings/data-sources'>数据源设置</a><form class='inline-form' action='/api/events/sync-now' method='post'><button type='submit'>立即同步</button></form></div>{event_filter_form(filters, '/events')}<section class='panel'><div class='section-head'><h2>公告事件</h2><span class='muted'>共 {result['total']} 条</span></div>{event_table(result['events'])}{pager}</section>"
+    return HTMLResponse(base_layout("公告雷达", body, session_user(request)))
+
+
+@app.get("/events/funds", response_class=HTMLResponse)
+def fund_events_page(request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    filters = event_filters(request)
+    result = event_query(filters, funds_only=True)
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Fund events</p><h1>国内基金公告</h1><p class='subtitle'>聚焦当前/历史持仓中的基金、ETF、LOF、QDII、债基和货币类产品。</p></div></section><div class='actions'><a href='/events'>全部公告</a><a href='/settings/data-sources'>数据源设置</a></div>{event_filter_form(filters, '/events/funds')}<section class='panel'><div class='section-head'><h2>基金公告</h2><span class='muted'>共 {result['total']} 条</span></div>{event_table(result['events'])}</section>"
+    return HTMLResponse(base_layout("国内基金公告", body, session_user(request)))
+
+
+@app.get("/events/us", response_class=HTMLResponse)
+def us_events_page(request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    body = "<section class='hero compact'><div><p class='eyebrow'>US filings</p><h1>美股/海外公告</h1><p class='subtitle'>SEC EDGAR 数据源已预留，默认未启用；第一版不执行海外公告抓取。</p></div></section><div class='actions'><a href='/settings/data-sources'>配置 SEC EDGAR</a><a href='/events'>返回公告雷达</a></div><section class='panel'><h2>未启用</h2><p class='muted'>开启后将从这里接入海外公告列表。</p></section>"
+    return HTMLResponse(base_layout("美股/海外公告", body, session_user(request)))
+
+
+@app.get("/events/{event_id}", response_class=HTMLResponse)
+def event_detail_page(event_id: int, request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    data = event_detail(event_id)
+    event = data["event"]
+    symbols = "".join(f"<tr><td>{esc(i.get('symbol'))}</td><td>{esc(i.get('symbol_name'))}</td><td>{esc(i.get('security_type'))}</td><td>{esc(i.get('batch_id'))}</td></tr>" for i in data["symbols"]) or "<tr><td colspan='4' class='muted'>暂无关联持仓</td></tr>"
+    source_link = f"<a href='{esc(event.get('source_url'))}' target='_blank' rel='noreferrer'>打开原文</a>" if event.get("source_url") else ""
+    pdf_link = f"<a href='{esc(event.get('pdf_url'))}' target='_blank' rel='noreferrer'>打开 PDF</a>" if event.get("pdf_url") else ""
+    state = data["state"]
+    insight = data["insight"]
+    risks = ", ".join(insight.get("risks") or []) if insight else ""
+    insight_html = "<p class='muted'>暂无 AI 解读。</p>" if not insight else f"<div class='insight'><p>{esc(insight.get('summary'))}</p><p><strong>相关原因：</strong>{esc(insight.get('relevance'))}</p><p><strong>风险点：</strong>{esc(risks)}</p></div>"
+    body = f"<section class='hero compact'><div><p class='eyebrow'>{esc(event.get('source_key'))}</p><h1>{fmt_date(event.get('announcement_date'))}</h1><p class='subtitle'>{esc(event.get('title'))}</p></div><div class='hero-meta'><span>类型</span><strong>{esc(event.get('event_type'))}</strong><span>重要性</span><strong>{esc(event.get('importance'))}</strong></div></section><div class='actions'>{source_link}{pdf_link}<form class='inline-form' action='/api/events/{event_id}/read' method='post'><input type='hidden' name='is_read' value='true'><button type='submit'>{'已读' if state.get('is_read') else '标为已读'}</button></form><form class='inline-form' action='/api/events/{event_id}/favorite' method='post'><input type='hidden' name='is_favorite' value='{'false' if state.get('is_favorite') else 'true'}'><button type='submit'>{'取消收藏' if state.get('is_favorite') else '收藏'}</button></form><form class='inline-form' action='/api/events/{event_id}/ignore' method='post'><input type='hidden' name='is_ignored' value='{'false' if state.get('is_ignored') else 'true'}'><button type='submit'>{'取消忽略' if state.get('is_ignored') else '忽略'}</button></form><form class='inline-form' action='/api/events/{event_id}/ai-insight' method='post'><button type='submit'>AI 解读</button></form></div><section class='panel'><h2>关联持仓</h2><table><thead><tr><th>代码</th><th>名称</th><th>类型</th><th>批次</th></tr></thead><tbody>{symbols}</tbody></table></section><section class='panel'><h2>AI 解读</h2>{insight_html}</section><section class='panel'><h2>原始信息</h2><pre class='report-text'>{esc(json.dumps(json_ready(event.get('raw_json') or {}), ensure_ascii=False, indent=2))}</pre></section>"
+    return HTMLResponse(base_layout("公告详情", body, session_user(request)))
+
+
+@app.get("/settings/data-sources", response_class=HTMLResponse)
+def data_sources_page(request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    with db_conn() as conn:
+        sources = event_provider.data_sources(conn)
+    forms = []
+    for item in sources:
+        checked = "checked" if item.get("enabled") else ""
+        configured = "已配置" if item.get("configured") else "未配置"
+        forms.append(f"<article class='panel'><form class='settings-form' action='/api/settings/data-sources/{esc(item['source_key'])}' method='post'><div class='section-head'><h2>{esc(item['display_name'])}</h2><span class='muted'>{esc(item['source_key'])} · {configured}</span></div><label class='check'><input type='checkbox' name='enabled' value='true' {checked}> 启用</label><label>抓取天数<input type='number' min='1' max='60' name='fetch_days' value='{esc(item.get('fetch_days'))}'></label><label>Token/API Key（留空不变）<input type='password' name='secret' autocomplete='off'></label><button type='submit'>保存</button></form></article>")
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Settings</p><h1>数据源配置</h1><p class='subtitle'>默认启用证监会基金电子披露和巨潮；第三方 token 只写入不回显。</p></div></section><div class='actions'><a href='/settings/ai'>AI 设置</a><a href='/events'>公告雷达</a></div>{''.join(forms)}"
+    return HTMLResponse(base_layout("数据源配置", body, session_user(request)))
+
+
+@app.get("/settings/ai", response_class=HTMLResponse)
+def ai_settings_page(request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    with db_conn() as conn:
+        settings = ai_insights.get_ai_settings(conn)
+    provider_options = "".join(f"<option value='{value}' {'selected' if settings.get('provider') == value else ''}>{label}</option>" for value, label in [("none", "关闭"), ("deepseek", "DeepSeek"), ("openai", "OpenAI")])
+    configured = "已配置" if settings.get("configured") else "未配置"
+    body = f"<section class='hero compact'><div><p class='eyebrow'>AI</p><h1>AI 解读配置</h1><p class='subtitle'>AI 默认关闭，只处理已抓到的公告，不主动搜索新闻，不输出买卖建议。</p></div></section><div class='actions'><a href='/settings/data-sources'>数据源设置</a><a href='/events'>公告雷达</a></div><section class='panel'><form class='settings-form' action='/api/settings/ai' method='post'><label>Provider<select name='provider'>{provider_options}</select></label><label>模型<input name='model' value='{esc(settings.get('model') or '')}' placeholder='留空使用默认模型'></label><label>每日上限<input type='number' min='1' max='500' name='daily_limit' value='{esc(settings.get('daily_limit'))}'></label><label>API Key（{configured}，留空不变）<input type='password' name='api_key' autocomplete='off'></label><button type='submit'>保存</button></form></section>"
+    return HTMLResponse(base_layout("AI 解读配置", body, session_user(request)))
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     if session_user(request):
@@ -1197,7 +1422,9 @@ def index(request: Request):
     alloc = asset_allocation(batch["batch_id"])
     industries = industry_allocation(batch["batch_id"])
     pnl_items = sorted(positions, key=lambda item: abs(float(item.get("holding_pnl") or 0)), reverse=True)
-    body = f"<section class='hero'><div><p class='eyebrow'>Latest portfolio</p><h1>持仓分析</h1><p class='subtitle'>最新成功批次：{esc(batch['batch_id'])}</p></div><div class='hero-meta'><span>上传</span><strong>{fmt_dt(batch.get('uploaded_at'))}</strong><span>文件</span><strong>{esc(batch.get('original_filename'))}</strong></div></section>{upload_form()}{metric_cards(batch, metrics)}<section class='grid two'><article class='panel'><h2>资产类型</h2>{bar_chart(alloc, 'allocation_bucket', 'weight')}</article><article class='panel'><h2>行业/主题</h2>{bar_chart(industries, 'industry_name', 'weight')}</article></section><section class='grid two'><article class='panel'><h2>持仓权重</h2>{bar_chart(positions, 'security_name', 'portfolio_weight')}</article><article class='panel'><h2>盈亏贡献</h2>{bar_chart(pnl_items, 'security_name', 'holding_pnl', True)}</article></section><section class='panel'><div class='section-head'><h2>最新报告</h2><a href='{batch_link(batch['batch_id'])}'>打开完整报告</a></div><pre class='report-text'>{esc((batch.get('report_markdown') or '')[:2200])}</pre></section><section class='panel'><h2>主要持仓</h2>{positions_table(positions)}</section>"
+    important = event_query({"source": "", "symbol": "", "type": "", "status": "", "start": "", "end": "", "page": 1, "per_page": 8}, latest_batch_only=True, important_only=True)
+    latest_events = f"<section class='panel'><div class='section-head'><h2>最新重要公告</h2><a href='/events'>全部公告</a></div>{event_table(important['events'][:8])}</section>"
+    body = f"<section class='hero'><div><p class='eyebrow'>Latest portfolio</p><h1>持仓分析</h1><p class='subtitle'>最新成功批次：{esc(batch['batch_id'])}</p></div><div class='hero-meta'><span>上传</span><strong>{fmt_dt(batch.get('uploaded_at'))}</strong><span>文件</span><strong>{esc(batch.get('original_filename'))}</strong></div></section>{upload_form()}{metric_cards(batch, metrics)}{latest_events}<section class='grid two'><article class='panel'><h2>资产类型</h2>{bar_chart(alloc, 'allocation_bucket', 'weight')}</article><article class='panel'><h2>行业/主题</h2>{bar_chart(industries, 'industry_name', 'weight')}</article></section><section class='grid two'><article class='panel'><h2>持仓权重</h2>{bar_chart(positions, 'security_name', 'portfolio_weight')}</article><article class='panel'><h2>盈亏贡献</h2>{bar_chart(pnl_items, 'security_name', 'holding_pnl', True)}</article></section><section class='panel'><div class='section-head'><h2>最新报告</h2><a href='{batch_link(batch['batch_id'])}'>打开完整报告</a></div><pre class='report-text'>{esc((batch.get('report_markdown') or '')[:2200])}</pre></section><section class='panel'><h2>主要持仓</h2>{positions_table(positions)}</section>"
     return HTMLResponse(base_layout("总览", body, user))
 
 
@@ -1465,6 +1692,184 @@ def api_analytics_xray(request: Request, batch_id: str = ""):
     return json_ready({"ok": True, **xray_data(batch["batch_id"])})
 
 
+@app.get("/api/settings/data-sources")
+def api_data_sources(request: Request):
+    require_user(request)
+    with db_conn() as conn:
+        return json_ready({"ok": True, "sources": event_provider.data_sources(conn)})
+
+
+@app.post("/api/settings/data-sources/{source_key}")
+async def api_update_data_source(source_key: str, request: Request):
+    require_user(request)
+    payload = await request_payload(request)
+    is_form = is_html_form(request)
+    enabled = bool_value(payload.get("enabled"), False if is_form else None)
+    fetch_days = int(payload["fetch_days"]) if str(payload.get("fetch_days") or "").strip() else None
+    secret = str(payload.get("secret") or payload.get("token") or "").strip() or None
+    replace_secret = bool_value(payload.get("replace_secret"), False) is True
+    public_config = {key: value for key, value in payload.items() if key.startswith("config_")}
+    public_config = {key.removeprefix("config_"): value for key, value in public_config.items()} if public_config else None
+    try:
+        with db_conn() as conn:
+            item = event_provider.update_data_source(conn, source_key, enabled, fetch_days, public_config, secret, replace_secret)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown data source") from exc
+    if is_form:
+        return RedirectResponse("/settings/data-sources", status_code=303)
+    return json_ready({"ok": True, "source": item})
+
+
+@app.post("/api/settings/data-sources/{source_key}/test")
+def api_test_data_source(source_key: str, request: Request):
+    require_user(request)
+    with db_conn() as conn:
+        try:
+            result = event_provider.test_source(conn, source_key)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Unknown data source") from exc
+    return json_ready(result)
+
+
+@app.get("/api/settings/ai")
+def api_ai_settings(request: Request):
+    require_user(request)
+    with db_conn() as conn:
+        return json_ready({"ok": True, "settings": ai_insights.get_ai_settings(conn)})
+
+
+@app.post("/api/settings/ai")
+async def api_update_ai_settings(request: Request):
+    require_user(request)
+    payload = await request_payload(request)
+    is_form = is_html_form(request)
+    provider = str(payload.get("provider") or "none")
+    model = str(payload.get("model") or "").strip() or None
+    daily_limit = int(payload["daily_limit"]) if str(payload.get("daily_limit") or "").strip() else 30
+    api_key = str(payload.get("api_key") or "").strip() or None
+    replace_key = bool_value(payload.get("replace_key"), False) is True
+    try:
+        with db_conn() as conn:
+            settings = ai_insights.update_ai_settings(conn, provider, model, daily_limit, api_key, replace_key)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail="Unknown AI provider") from exc
+    if is_form:
+        return RedirectResponse("/settings/ai", status_code=303)
+    return json_ready({"ok": True, "settings": settings})
+
+
+@app.post("/api/settings/ai/test")
+def api_test_ai(request: Request):
+    require_user(request)
+    with db_conn() as conn:
+        return json_ready(ai_insights.test_ai_connection(conn))
+
+
+@app.post("/api/events/sync-now")
+def api_sync_events_now(request: Request):
+    require_user(request)
+    is_form = is_html_form(request)
+    with db_conn() as conn:
+        result = event_provider.sync_enabled_sources(conn)
+    if is_form:
+        return RedirectResponse("/events", status_code=303)
+    return json_ready({"ok": True, **result})
+
+
+@app.get("/api/events")
+def api_events(request: Request):
+    require_user(request)
+    return json_ready({"ok": True, **event_query(event_filters(request))})
+
+
+@app.get("/api/events/{event_id}")
+def api_event_detail(event_id: int, request: Request):
+    require_user(request)
+    return json_ready({"ok": True, **event_detail(event_id)})
+
+
+@app.post("/api/events/{event_id}/read")
+async def api_mark_event_read(event_id: int, request: Request):
+    require_user(request)
+    payload = await request_payload(request)
+    is_form = is_html_form(request)
+    is_read = bool_value(payload.get("is_read"), True)
+    is_ignored = bool_value(payload.get("is_ignored"), None)
+    execute(
+        """
+        INSERT INTO portfolio_event_reads (event_id, is_read, is_ignored, read_at, updated_at)
+        VALUES (%s, %s, COALESCE(%s, false), CASE WHEN %s THEN NOW() ELSE NULL END, NOW())
+        ON CONFLICT (event_id) DO UPDATE SET
+            is_read = EXCLUDED.is_read,
+            is_ignored = COALESCE(%s, portfolio_event_reads.is_ignored),
+            read_at = CASE WHEN EXCLUDED.is_read THEN COALESCE(portfolio_event_reads.read_at, NOW()) ELSE NULL END,
+            updated_at = NOW()
+        """,
+        (event_id, is_read, is_ignored, is_read, is_ignored),
+    )
+    if is_form:
+        return RedirectResponse(f"/events/{event_id}", status_code=303)
+    return {"ok": True}
+
+
+@app.post("/api/events/{event_id}/favorite")
+async def api_favorite_event(event_id: int, request: Request):
+    require_user(request)
+    payload = await request_payload(request)
+    is_form = is_html_form(request)
+    favorite = bool_value(payload.get("is_favorite"), True)
+    execute(
+        """
+        INSERT INTO portfolio_event_reads (event_id, is_favorite, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (event_id) DO UPDATE SET
+            is_favorite = EXCLUDED.is_favorite,
+            updated_at = NOW()
+        """,
+        (event_id, favorite),
+    )
+    if is_form:
+        return RedirectResponse(f"/events/{event_id}", status_code=303)
+    return {"ok": True}
+
+
+@app.post("/api/events/{event_id}/ignore")
+async def api_ignore_event(event_id: int, request: Request):
+    require_user(request)
+    payload = await request_payload(request)
+    is_form = is_html_form(request)
+    ignored = bool_value(payload.get("is_ignored"), True)
+    execute(
+        """
+        INSERT INTO portfolio_event_reads (event_id, is_ignored, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (event_id) DO UPDATE SET
+            is_ignored = EXCLUDED.is_ignored,
+            updated_at = NOW()
+        """,
+        (event_id, ignored),
+    )
+    if is_form:
+        return RedirectResponse(f"/events/{event_id}", status_code=303)
+    return {"ok": True}
+
+
+@app.post("/api/events/{event_id}/ai-insight")
+async def api_event_ai_insight(event_id: int, request: Request):
+    require_user(request)
+    payload = await request_payload(request)
+    is_form = is_html_form(request)
+    force = bool_value(payload.get("force"), False) is True
+    with db_conn() as conn:
+        try:
+            result = ai_insights.generate_insight(conn, event_id, force)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Event not found") from exc
+    if is_form:
+        return RedirectResponse(f"/events/{event_id}", status_code=303)
+    return json_ready(result)
+
+
 @app.post("/api/uploads/{batch_id}/replace")
 async def replace_batch(batch_id: str, request: Request, file: UploadFile = File(...)):
     require_user(request)
@@ -1537,6 +1942,9 @@ def table_counts() -> list[dict[str, Any]]:
         "portfolio_daily_summary",
         "portfolio_daily_allocation",
         "portfolio_daily_exposure",
+        "portfolio_events",
+        "portfolio_event_symbols",
+        "portfolio_event_fetch_runs",
     ]
     return [
         {"table": name, "rows": (one(f"SELECT COUNT(*) AS count FROM {name}") or {}).get("count", 0)}
@@ -1650,6 +2058,6 @@ def health():
 
 CSS = """
 :root { color-scheme: light; --bg: #f6f7f4; --ink: #151817; --muted: #65706b; --line: #dfe4df; --panel: #fff; --accent: #0f766e; --bad: #b91c1c; }
-* { box-sizing: border-box; } body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; } a { color: inherit; } .topbar { position: sticky; top: 0; z-index: 10; display:flex; justify-content:space-between; align-items:center; padding: 14px 28px; border-bottom:1px solid var(--line); background: rgba(246,247,244,.94); backdrop-filter: blur(10px); } .brand { font-weight: 800; text-decoration:none; } nav { display:flex; gap: 18px; color: var(--muted); flex-wrap:wrap; } nav a { text-decoration:none; } main { width:min(1440px, 100%); margin:0 auto; padding:28px; } .hero { display:flex; justify-content:space-between; align-items:end; gap:24px; min-height: 190px; padding: 34px 0 28px; border-bottom:1px solid var(--line); } .hero.compact { min-height: 130px; } .eyebrow { margin:0 0 8px; color:var(--accent); font-weight:800; text-transform:uppercase; } h1 { margin:0; font-size: clamp(42px, 7vw, 88px); line-height:.92; letter-spacing:0; } h2 { margin:0 0 14px; font-size: 18px; } .subtitle { margin:14px 0 0; max-width: 800px; color: var(--muted); font-size: 17px; } .hero-meta { display:grid; gap:4px; text-align:right; min-width:230px; } .hero-meta span, .muted { color:var(--muted); } .upload, .filters { display:flex; flex-wrap:wrap; gap:12px; align-items:end; padding:16px; margin:18px 0; border:1px solid var(--line); background:var(--panel); border-radius:8px; } label { display:grid; gap:6px; color:var(--muted); font-weight:700; } input, select { min-height:40px; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); } button, .actions a, .section-head a, .pager a { display:inline-flex; align-items:center; min-height:40px; padding:0 14px; border:1px solid #0f766e; border-radius:6px; background:#0f766e; color:white; text-decoration:none; font-weight:800; } .actions { display:flex; gap:10px; margin:16px 0; flex-wrap:wrap; } .metrics { display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap:12px; margin: 18px 0; } .metrics article, .panel { border:1px solid var(--line); border-radius:8px; background:var(--panel); } .metrics article { padding:14px; } .metrics span { display:block; color:var(--muted); font-size:12px; text-transform:uppercase; } .metrics strong { display:block; margin-top:6px; font-size:22px; overflow-wrap:anywhere; } .grid { display:grid; gap:14px; margin:14px 0; } .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); } .panel { padding:16px; overflow:hidden; margin:14px 0; } .section-head { display:flex; justify-content:space-between; align-items:center; gap:16px; } .bars { display:grid; gap:10px; } .bar-row { display:grid; grid-template-columns: minmax(110px, 190px) minmax(120px, 1fr) 90px; gap:10px; align-items:center; } .bar-row span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .bar-row div { height:12px; background:#edf1ed; border-radius:999px; overflow:hidden; } .bar-row i { display:block; height:100%; background:#0f766e; border-radius:999px; } .bar-row b { text-align:right; font-size:12px; } .table-wrap { overflow:auto; } table { width:100%; border-collapse:collapse; font-size:13px; } th, td { padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-size:12px; text-transform:uppercase; } tr.status-failed td { color: var(--bad); } tr.status-duplicate td, tr.status-partial td { color:#92400e; } .report-text { white-space:pre-wrap; margin:0; padding:14px; max-height: 520px; overflow:auto; border:1px solid var(--line); border-radius:8px; background:#fbfcfa; color:#23302a; } .login { width:min(420px, 100%); margin:80px auto; padding:24px; border:1px solid var(--line); border-radius:8px; background:var(--panel); } .login h1 { font-size:42px; margin-bottom:20px; } .login form { display:grid; gap:14px; } .form-hint { align-self:center; margin:0; color:var(--muted); max-width:420px; } .chart { width:100%; height:auto; min-height:220px; overflow:visible; } .chart line { stroke:var(--line); } .chart text { fill:var(--muted); font-size:12px; } .chart-legend { display:flex; flex-wrap:wrap; gap:12px; margin:0 0 8px; color:var(--muted); font-weight:700; } .chart-legend span { display:inline-flex; align-items:center; gap:6px; } .chart-legend i { width:10px; height:10px; border-radius:999px; display:inline-block; } .month-grid { display:flex; flex-wrap:wrap; gap:10px; } .month-chip { display:inline-grid; gap:2px; min-width:112px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:#fbfcfa; text-decoration:none; } .month-chip.active { border-color:var(--accent); box-shadow: inset 0 0 0 1px var(--accent); } .month-chip b { color:var(--accent); } .inline-form { display:flex; gap:8px; align-items:center; margin:0; } .inline-form input { max-width:220px; } .inline-form button { min-height:36px; } .pager { display:flex; gap:12px; justify-content:flex-end; align-items:center; margin-top:14px; color:var(--muted); }
+* { box-sizing: border-box; } body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; } a { color: inherit; } .topbar { position: sticky; top: 0; z-index: 10; display:flex; justify-content:space-between; align-items:center; padding: 14px 28px; border-bottom:1px solid var(--line); background: rgba(246,247,244,.94); backdrop-filter: blur(10px); } .brand { font-weight: 800; text-decoration:none; } nav { display:flex; gap: 18px; color: var(--muted); flex-wrap:wrap; } nav a { text-decoration:none; } main { width:min(1440px, 100%); margin:0 auto; padding:28px; } .hero { display:flex; justify-content:space-between; align-items:end; gap:24px; min-height: 190px; padding: 34px 0 28px; border-bottom:1px solid var(--line); } .hero.compact { min-height: 130px; } .eyebrow { margin:0 0 8px; color:var(--accent); font-weight:800; text-transform:uppercase; } h1 { margin:0; font-size: clamp(42px, 7vw, 88px); line-height:.92; letter-spacing:0; } h2 { margin:0 0 14px; font-size: 18px; } .subtitle { margin:14px 0 0; max-width: 800px; color: var(--muted); font-size: 17px; } .hero-meta { display:grid; gap:4px; text-align:right; min-width:230px; } .hero-meta span, .muted { color:var(--muted); } .upload, .filters, .settings-form { display:flex; flex-wrap:wrap; gap:12px; align-items:end; padding:16px; margin:18px 0; border:1px solid var(--line); background:var(--panel); border-radius:8px; } label { display:grid; gap:6px; color:var(--muted); font-weight:700; } label.check { display:flex; align-items:center; gap:8px; min-height:40px; } label.check input { min-height:auto; } input, select { min-height:40px; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); } button, .actions a, .section-head a, .pager a { display:inline-flex; align-items:center; min-height:40px; padding:0 14px; border:1px solid #0f766e; border-radius:6px; background:#0f766e; color:white; text-decoration:none; font-weight:800; } .actions { display:flex; gap:10px; margin:16px 0; flex-wrap:wrap; } .metrics { display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap:12px; margin: 18px 0; } .metrics article, .panel { border:1px solid var(--line); border-radius:8px; background:var(--panel); } .metrics article { padding:14px; } .metrics span { display:block; color:var(--muted); font-size:12px; text-transform:uppercase; } .metrics strong { display:block; margin-top:6px; font-size:22px; overflow-wrap:anywhere; } .grid { display:grid; gap:14px; margin:14px 0; } .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); } .panel { padding:16px; overflow:hidden; margin:14px 0; } .section-head { display:flex; justify-content:space-between; align-items:center; gap:16px; } .bars { display:grid; gap:10px; } .bar-row { display:grid; grid-template-columns: minmax(110px, 190px) minmax(120px, 1fr) 90px; gap:10px; align-items:center; } .bar-row span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .bar-row div { height:12px; background:#edf1ed; border-radius:999px; overflow:hidden; } .bar-row i { display:block; height:100%; background:#0f766e; border-radius:999px; } .bar-row b { text-align:right; font-size:12px; } .table-wrap { overflow:auto; } table { width:100%; border-collapse:collapse; font-size:13px; } th, td { padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-size:12px; text-transform:uppercase; } tr.status-failed td { color: var(--bad); } tr.status-duplicate td, tr.status-partial td { color:#92400e; } tr.event-row.is-read td { color: var(--muted); } .insight { padding:14px; border:1px solid var(--line); border-radius:8px; background:#fbfcfa; } .report-text { white-space:pre-wrap; margin:0; padding:14px; max-height: 520px; overflow:auto; border:1px solid var(--line); border-radius:8px; background:#fbfcfa; color:#23302a; } .login { width:min(420px, 100%); margin:80px auto; padding:24px; border:1px solid var(--line); border-radius:8px; background:var(--panel); } .login h1 { font-size:42px; margin-bottom:20px; } .login form { display:grid; gap:14px; } .form-hint { align-self:center; margin:0; color:var(--muted); max-width:420px; } .chart { width:100%; height:auto; min-height:220px; overflow:visible; } .chart line { stroke:var(--line); } .chart text { fill:var(--muted); font-size:12px; } .chart-legend { display:flex; flex-wrap:wrap; gap:12px; margin:0 0 8px; color:var(--muted); font-weight:700; } .chart-legend span { display:inline-flex; align-items:center; gap:6px; } .chart-legend i { width:10px; height:10px; border-radius:999px; display:inline-block; } .month-grid { display:flex; flex-wrap:wrap; gap:10px; } .month-chip { display:inline-grid; gap:2px; min-width:112px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:#fbfcfa; text-decoration:none; } .month-chip.active { border-color:var(--accent); box-shadow: inset 0 0 0 1px var(--accent); } .month-chip b { color:var(--accent); } .inline-form { display:flex; gap:8px; align-items:center; margin:0; } .inline-form input { max-width:220px; } .inline-form button { min-height:36px; } .pager { display:flex; gap:12px; justify-content:flex-end; align-items:center; margin-top:14px; color:var(--muted); }
 @media (max-width: 900px) { main { padding:18px; } .hero { display:block; } .hero-meta { text-align:left; margin-top:18px; } .grid.two, .metrics { grid-template-columns:1fr; } .bar-row { grid-template-columns: 1fr; gap:4px; } .bar-row b { text-align:left; } table { min-width: 900px; } .panel { overflow:auto; } }
 """
