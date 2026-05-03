@@ -21,8 +21,7 @@ FUND_SECURITY_TYPES = {
 }
 
 DATA_SOURCE_DEFAULTS = {
-    "fund_eid": {"display_name": "证监会基金电子披露", "enabled": True, "fetch_days": 7},
-    "cninfo": {"display_name": "巨潮资讯", "enabled": True, "fetch_days": 7},
+    "cninfo": {"display_name": "巨潮资讯官方 API", "enabled": True, "fetch_days": 7},
     "tushare": {"display_name": "Tushare", "enabled": False, "fetch_days": 7},
     "sec_edgar": {"display_name": "SEC EDGAR", "enabled": False, "fetch_days": 7},
 }
@@ -34,6 +33,7 @@ def now_utc() -> datetime:
 
 def ensure_event_defaults(conn) -> None:
     with conn.cursor() as cur:
+        cur.execute("DELETE FROM portfolio_data_sources WHERE source_key = 'fund_eid'")
         for key, item in DATA_SOURCE_DEFAULTS.items():
             cur.execute(
                 """
@@ -59,10 +59,9 @@ def data_sources(conn) -> list[dict[str, Any]]:
                    last_sync_at, last_sync_status, last_sync_message, updated_at
             FROM portfolio_data_sources
             ORDER BY CASE source_key
-                WHEN 'fund_eid' THEN 1
-                WHEN 'cninfo' THEN 2
-                WHEN 'tushare' THEN 3
-                WHEN 'sec_edgar' THEN 4
+                WHEN 'cninfo' THEN 1
+                WHEN 'tushare' THEN 2
+                WHEN 'sec_edgar' THEN 3
                 ELSE 99
             END
             """
@@ -270,7 +269,10 @@ def sync_enabled_sources(conn) -> dict[str, Any]:
     ensure_event_defaults(conn)
     watchlist = latest_watchlist(conn)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM portfolio_data_sources WHERE enabled = TRUE ORDER BY source_key")
+        cur.execute(
+            "SELECT * FROM portfolio_data_sources WHERE enabled = TRUE AND source_key = ANY(%s) ORDER BY source_key",
+            (list(DATA_SOURCE_DEFAULTS.keys()),),
+        )
         sources = [dict(row) for row in cur.fetchall()]
     runs = [sync_source(conn, source, watchlist) for source in sources]
     return {"watchlist_count": len(watchlist), "runs": runs}
@@ -285,7 +287,7 @@ def test_source(conn, source_key: str) -> dict[str, Any]:
         raise KeyError(source_key)
     try:
         module = source_module(source_key)
-        module.fetch_events([], date.today() - timedelta(days=1), 1, dict(source.get("public_config") or {}), decrypt_secret(source.get("encrypted_secret")))
+        module.fetch_events(latest_watchlist(conn)[:1], date.today() - timedelta(days=1), 1, dict(source.get("public_config") or {}), decrypt_secret(source.get("encrypted_secret")))
         return {"ok": True, "source_key": source_key, "status": "available"}
     except Exception as exc:
         return {"ok": False, "source_key": source_key, "status": "unavailable", "message": str(exc)[:300]}

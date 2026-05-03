@@ -63,10 +63,11 @@ The event radar builds a watchlist from the latest successful portfolio batch, p
 
 Default sources:
 
-- `fund_eid` — China Securities Regulatory Commission fund electronic disclosure site, enabled by default.
-- `cninfo` — CNINFO/Juchao announcements, enabled by default.
+- `cninfo` — CNINFO/Juchao announcements, enabled by default and used as the primary domestic source.
 - `tushare` — disabled by default; can be enabled with a token for structured enhancement.
 - `sec_edgar` — disabled placeholder for future overseas holdings.
+
+CNINFO can run in three modes from `/settings/data-sources`: official API first with fallback, official API only, or public announcement search only. If you have a paid CNINFO data-service token, enter it on the settings page and fill the official API path from the CNINFO data-service documentation. Tokens are encrypted and never displayed again.
 
 Events support read, favorite, and ignored state. AI insights are optional and only run against already-stored announcements.
 

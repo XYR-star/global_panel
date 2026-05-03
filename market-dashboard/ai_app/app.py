@@ -1252,7 +1252,7 @@ def event_filter_form(filters: dict[str, Any], action: str) -> str:
     )
     source_options = "".join(
         f"<option value='{value}' {'selected' if filters.get('source') == value else ''}>{label}</option>"
-        for value, label in [("", "全部来源"), ("fund_eid", "证监会基金电子披露"), ("cninfo", "巨潮资讯"), ("tushare", "Tushare"), ("sec_edgar", "SEC EDGAR")]
+        for value, label in [("", "全部来源"), ("cninfo", "巨潮资讯"), ("tushare", "Tushare"), ("sec_edgar", "SEC EDGAR")]
     )
     return f"<form class='filters' method='get' action='{action}'><label>来源<select name='source'>{source_options}</select></label><label>代码<input name='symbol' value='{esc(filters.get('symbol'))}'></label><label>类型<input name='type' value='{esc(filters.get('type'))}'></label><label>状态<select name='status'>{status_options}</select></label><label>开始<input type='date' name='start' value='{esc(filters.get('start'))}'></label><label>结束<input type='date' name='end' value='{esc(filters.get('end'))}'></label><button type='submit'>筛选</button></form>"
 
@@ -1352,8 +1352,16 @@ def data_sources_page(request: Request):
     for item in sources:
         checked = "checked" if item.get("enabled") else ""
         configured = "已配置" if item.get("configured") else "未配置"
-        forms.append(f"<article class='panel'><form class='settings-form' action='/api/settings/data-sources/{esc(item['source_key'])}' method='post'><div class='section-head'><h2>{esc(item['display_name'])}</h2><span class='muted'>{esc(item['source_key'])} · {configured}</span></div><label class='check'><input type='checkbox' name='enabled' value='true' {checked}> 启用</label><label>抓取天数<input type='number' min='1' max='60' name='fetch_days' value='{esc(item.get('fetch_days'))}'></label><label>Token/API Key（留空不变）<input type='password' name='secret' autocomplete='off'></label><button type='submit'>保存</button></form></article>")
-    body = f"<section class='hero compact'><div><p class='eyebrow'>Settings</p><h1>数据源配置</h1><p class='subtitle'>默认启用证监会基金电子披露和巨潮；第三方 token 只写入不回显。</p></div></section><div class='actions'><a href='/settings/ai'>AI 设置</a><a href='/events'>公告雷达</a></div>{''.join(forms)}"
+        extra = ""
+        if item["source_key"] == "cninfo":
+            config = item.get("public_config") or {}
+            mode = config.get("mode") or "auto"
+            method = config.get("method") or "POST"
+            mode_options = "".join(f"<option value='{value}' {'selected' if mode == value else ''}>{label}</option>" for value, label in [("auto", "官方优先，失败回退网页"), ("official", "只用官方 API"), ("public", "只用网页公告接口")])
+            method_options = "".join(f"<option value='{value}' {'selected' if method == value else ''}>{value}</option>" for value in ["POST", "GET"])
+            extra = f"<label>模式<select name='config_mode'>{mode_options}</select></label><label>官方 API Path<input name='config_api_path' value='{esc(config.get('api_path') or '')}' placeholder='/api/...'></label><label>Token 参数名<input name='config_token_param' value='{esc(config.get('token_param') or 'key')}'></label><label>代码参数名<input name='config_symbol_param' value='{esc(config.get('symbol_param') or 'scode')}'></label><label>开始日期参数<input name='config_start_date_param' value='{esc(config.get('start_date_param') or 'sdate')}'></label><label>结束日期参数<input name='config_end_date_param' value='{esc(config.get('end_date_param') or 'edate')}'></label><label>请求方法<select name='config_method'>{method_options}</select></label>"
+        forms.append(f"<article class='panel'><form class='settings-form' action='/api/settings/data-sources/{esc(item['source_key'])}' method='post'><div class='section-head'><h2>{esc(item['display_name'])}</h2><span class='muted'>{esc(item['source_key'])} · {configured}</span></div><label class='check'><input type='checkbox' name='enabled' value='true' {checked}> 启用</label><label>抓取天数<input type='number' min='1' max='60' name='fetch_days' value='{esc(item.get('fetch_days'))}'></label>{extra}<label>Token/API Key（留空不变）<input type='password' name='secret' autocomplete='off'></label><button type='submit'>保存</button></form></article>")
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Settings</p><h1>数据源配置</h1><p class='subtitle'>国内公告主源为巨潮资讯；官方 token 只写入不回显，未填 API Path 时会使用巨潮网页公告接口。</p></div></section><div class='actions'><a href='/settings/ai'>AI 设置</a><a href='/events'>公告雷达</a></div>{''.join(forms)}"
     return HTMLResponse(base_layout("数据源配置", body, session_user(request)))
 
 
