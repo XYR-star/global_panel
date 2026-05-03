@@ -136,6 +136,29 @@ def _secret_values(secret: str) -> dict[str, str]:
     return {str(key): str(value) for key, value in data.items() if value}
 
 
+def _fetch_access_token(client: httpx.Client, credentials: dict[str, str]) -> str | None:
+    if credentials.get("access_token"):
+        return credentials["access_token"]
+    access_key = credentials.get("access_key")
+    access_secret = credentials.get("access_secret")
+    if not access_key or not access_secret:
+        return None
+    response = client.post(
+        f"{OFFICIAL_BASE}/api-cloud-platform/oauth2/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": access_key,
+            "client_secret": access_secret,
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError(str(payload.get("error_description") or payload.get("error"))[:300])
+    token = payload.get("access_token")
+    return str(token) if token else None
+
+
 def _official_fetch(watchlist: list[dict[str, Any]], since: date, config: dict[str, Any], secret: str) -> list[Announcement]:
     path = str(config.get("api_path") or config.get("official_api_path") or "").strip()
     if not path:
@@ -143,8 +166,8 @@ def _official_fetch(watchlist: list[dict[str, Any]], since: date, config: dict[s
     url = path if path.startswith("http") else f"{OFFICIAL_BASE}{path if path.startswith('/') else '/' + path}"
     credentials = _secret_values(secret)
     token_param = str(config.get("token_param") or "access_token").strip()
-    access_key_param = str(config.get("access_key_param") or "accessKey").strip()
-    access_secret_param = str(config.get("access_secret_param") or "accessSecret").strip()
+    access_key_param = str(config.get("access_key_param") or "").strip()
+    access_secret_param = str(config.get("access_secret_param") or "").strip()
     method = str(config.get("method") or "POST").upper()
     start_key = str(config.get("start_date_param") or "sdate")
     end_key = str(config.get("end_date_param") or "edate")
@@ -160,6 +183,9 @@ def _official_fetch(watchlist: list[dict[str, Any]], since: date, config: dict[s
     timeout = httpx.Timeout(15.0, connect=6.0)
     out: list[Announcement] = []
     with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        access_token = _fetch_access_token(client, credentials)
+        if not access_token and token_param:
+            raise RuntimeError("CNINFO access_token is not configured and cannot be generated")
         for item in watchlist:
             code = str(item.get("symbol") or "").zfill(6)
             params: dict[str, Any] = {
@@ -168,8 +194,8 @@ def _official_fetch(watchlist: list[dict[str, Any]], since: date, config: dict[s
                 end_key: date.today().isoformat(),
                 **extra_params,
             }
-            if token_param and (credentials.get("access_token") or credentials.get("token")):
-                params[token_param] = credentials.get("access_token") or credentials.get("token")
+            if token_param and access_token:
+                params[token_param] = access_token
             if access_key_param and credentials.get("access_key"):
                 params[access_key_param] = credentials["access_key"]
             if access_secret_param and credentials.get("access_secret"):
@@ -177,9 +203,19 @@ def _official_fetch(watchlist: list[dict[str, Any]], since: date, config: dict[s
             response = client.request(method, url, params=params if method == "GET" else None, data=params if method != "GET" else None)
             response.raise_for_status()
             payload = response.json()
+            if isinstance(payload, dict) and payload.get("resultcode") in (404, 405) and credentials.get("access_key") and credentials.get("access_secret"):
+                credentials.pop("access_token", None)
+                access_token = _fetch_access_token(client, credentials)
+                if token_param and access_token:
+                    params[token_param] = access_token
+                response = client.request(method, url, params=params if method == "GET" else None, data=params if method != "GET" else None)
+                response.raise_for_status()
+                payload = response.json()
             records = _records(payload)
-            if not records and isinstance(payload, dict) and payload.get("retCode") not in (None, 1, "1", 0, "0"):
-                raise RuntimeError(str(payload.get("retMsg") or payload.get("msg") or payload)[:300])
+            if not records and isinstance(payload, dict):
+                ok_codes = (None, 1, "1", 0, "0", 200, "200")
+                if payload.get("retCode") not in ok_codes or payload.get("resultcode") not in ok_codes:
+                    raise RuntimeError(str(payload.get("resultmsg") or payload.get("retMsg") or payload.get("msg") or payload)[:300])
             for row in records:
                 event = _event_from_row(row, code, since, "official_webapi")
                 if event:
