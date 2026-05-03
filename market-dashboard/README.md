@@ -1,135 +1,152 @@
-# Market Dashboard
+# Ricky Portfolio App
 
-Grafana-based market dashboard for `market.heyrickishere.com`.
+Private, login-protected portfolio upload and analysis system. The app is designed for a personal workflow where one or more brokerage/exported holding files may be uploaded every trading day, while preserving every accepted file as historical evidence.
 
-## What is here
+This repository used to contain a Grafana-style market dashboard. That stack has been removed. The current project is a focused portfolio analysis app.
 
-- `docker-compose.yml`: Grafana + Postgres
-- `sync_market_data.py`: fetches market and macro series into Postgres
-- `providers/`: provider modules for FRED, NY Fed, AKShare, and SEC EDGAR
-- `ai_app/`: `/ai/` research subpage and JSON APIs
-- `grafana/provisioning/`: datasource + dashboard provisioning
-- `deploy/nginx/`: nginx site config
-- `deploy/systemd/`: timer-driven sync service
+## What It Does
 
-## Default data providers
+- Accepts single or multi-file `.xlsx` uploads.
+- Automatically infers the portfolio snapshot date from workbook labels or filename.
+- Rejects duplicate files before persistence, so duplicates do not create records or copied files.
+- Keeps every accepted file as an independent historical batch.
+- Lets an existing batch be replaced when an upload was incomplete or wrong.
+- Shows the latest effective portfolio by holding date, not by raw upload order.
+- Provides report pages, adjacent-batch comparison, trend cockpit, X-Ray style lookthrough, and monthly file management.
+- Protects all portfolio data behind login and temporary lockout after repeated failed login attempts.
 
-- Global market, macro, rates, credit, FX, and commodity data: FRED `fredgraph.csv`
-- Global supply-chain pressure: NY Fed GSCPI CSV
-- China A-share indices, sample quotes, industry boards, fund flow, and company profiles: AKShare
-- AKShare V2 adds broader A-share snapshots, selected stock histories, market fund flow, concept boards, industry constituents, financial indicators, and company news.
-- U.S. company filings and XBRL facts: SEC EDGAR official JSON APIs
+## Tech Stack
 
-The default stack is free-first and does not require paid market data keys. AKShare and SEC EDGAR are provider modules, so later additions such as Tushare, BaoStock, paid market feeds, or iFinD/Skill tools can be added without changing the Grafana datasource or the core Postgres tables.
+- **Backend:** FastAPI served by Uvicorn.
+- **Database:** PostgreSQL 16.
+- **Runtime:** Docker Compose with two services: `postgres` and `portfolio-app`.
+- **Parsing:** `openpyxl` for workbook reading; `pandas` for date/value normalization helpers.
+- **Portfolio analytics:** deterministic Python logic in `providers/portfolio.py` and import helpers in `sync_portfolio_data.py`.
+- **Charts/UI:** server-rendered HTML/CSS with inline SVG charts. No frontend build pipeline is required.
+- **Optional enrichment:** AkShare can be enabled for fund metadata/lookthrough enrichment, but the core dashboard works from uploaded files without external market APIs.
 
-## V2 data model
+## Main Screens
 
-- `market_data_points`: numeric time series for charts and agent evidence.
-- `market_asset_snapshot`: latest numeric values; existing Grafana panels continue to use this table.
-- `data_asset_catalog`: asset/source metadata with `latest_observation_ts` and `last_synced_at`.
-- `market_text_records`: structured text evidence such as SEC filings and A-share company profiles.
-- `data_sync_status`: per-provider run status, including sync time and latest observation time.
+- `/` — latest portfolio overview, upload form, core metrics, allocation bars, latest report excerpt, major holdings.
+- `/timeline` — trend cockpit across accepted historical files.
+- `/uploads` — monthly paged file management with filters and replacement controls.
+- `/reports/{batch_id}` — full report for a single upload batch.
+- `/compare?from=...&to=...` — position and risk changes between two batches.
 
-The dashboard refreshes every 10 minutes, and the systemd timer runs the sync every 10 minutes. Some sources update daily, monthly, or quarterly, so the status panel separates `sync_run` from `latest_observation`.
+## Trend Cockpit
 
-## AI research subpage
+The timeline page uses accepted `complete` and `partial` batches ordered by `as_of_date`, then `uploaded_at` for same-day versions. It currently shows:
 
-The V2 research page is served at `/ai/` by the `ai-research` service. It reads Postgres directly and exposes:
+- Total assets trend.
+- Daily, holding, and cumulative P/L trend.
+- Top 3, Top 5, and Top 10 concentration trend.
+- Equity-like, bond-like, QDII, and cash/monetary drift.
+- Asset-type stacked area chart.
+- Estimated drawdown based on uploaded portfolio values.
+- Consecutive loss batch count.
+- Top position changes versus the previous accepted batch.
 
-- `/ai/`: HTML research workspace
-- `/ai/api/health`: database health
-- `/ai/api/data-status`: provider status
-- `/ai/api/summary`: A-share, SEC, inventory, and freshness summary
+No market benchmark or external price API is required for this first version.
 
-The first version shows data-backed research evidence. LLM-generated agent reports can be added on top of the same API/data model.
+## X-Ray / Lookthrough
 
-## Agent reports
+The X-Ray section uses existing imported data to show:
 
-`generate_agent_report.py` builds a compact research context from the database, calls an OpenAI-compatible chat completions endpoint, and stores the result in:
+- Top underlying holdings.
+- Underlying holdings that appear through more than one parent fund/ETF.
+- Industry/theme exposure.
+- Main contributors behind each industry/theme exposure.
 
-- `agent_reports`
-- `agent_report_evidence`
+When external enrichment is unavailable, the system falls back to product-level exposure and workbook-derived categories.
 
-If `OPENAI_API_KEY` is missing, the script still writes a `needs_config` report so `/ai/` can explain what is missing without failing.
+## File Management
 
-Required/optional model settings:
+Uploads are treated as historical records:
 
-- `OPENAI_API_KEY=`
-- `OPENAI_BASE_URL=https://api.openai.com/v1`
-- `OPENAI_MODEL=gpt-4.1-mini`
-- `AGENT_REPORT_TYPE=market_research_v1`
-- `AGENT_TEMPERATURE=0.2`
-- `AGENT_LLM_TIMEOUT_SECONDS=90`
-- `MARKET_DATA_ROOT=/www/market-dashboard-data`
+- Each accepted file creates one `batch_id`.
+- Multiple files on the same day are allowed.
+- Duplicate SHA-256 files are rejected before saving.
+- `/uploads` defaults to the latest month and supports month, status, filename/batch search, date range, and pagination.
+- Replacement keeps the same `batch_id`, clears old derived rows for that batch, saves the new source file, and regenerates analysis.
+- Replacing with the exact same file is a no-op.
+- Replacing with a file already used by another batch is rejected.
 
-Run once:
+There is intentionally no public delete or archive workflow in the UI because accepted files are considered real historical data.
 
-```bash
-cd /root/global_panel/market-dashboard
-set -a; . /etc/market-dashboard.env; set +a
-./.venv/bin/python generate_agent_report.py
-```
+## APIs
 
-Install the hourly report timer from `deploy/systemd/market-agent-report.*` after copying the files to `/etc/systemd/system/`.
+All APIs except health require login.
 
-## Provider configuration
+- `GET /api/health` — app health.
+- `POST /api/upload` — single or multi-file upload. Form fields: `files` and optional `as_of_date`.
+- `GET /api/uploads?month=YYYY-MM&status=complete&q=...&page=1` — paged upload records.
+- `POST /api/uploads/{batch_id}/replace` — replace one batch with a new `.xlsx` file.
+- `GET /api/portfolio/latest` — latest effective portfolio by holding date.
+- `GET /api/portfolio/{batch_id}` — batch report data as JSON.
+- `GET /api/analytics/timeline?months=6` — trend cockpit data.
+- `GET /api/analytics/xray?batch_id=...` — lookthrough/X-Ray data.
 
-Set these in `/etc/market-dashboard.env` as needed:
+## Data Model
 
-- `AKSHARE_ENABLED=true`
-- `AKSHARE_FINANCIAL_SYMBOLS=600519,000001,300750,300059,688981`
-- `AKSHARE_ANNOUNCEMENT_SYMBOLS=600519,000001,300750,300059,688981`
-- `AKSHARE_NEWS_SYMBOLS=300059,600519,300750`
-- `MARKET_SYNC_USE_CACHE_ON_FAILURE=true`
-- `AKSHARE_MARKET_FLOW_INTERVAL_MINUTES=30`
-- `AKSHARE_FINANCIAL_INTERVAL_MINUTES=1440`
-- `AKSHARE_ANNOUNCEMENT_INTERVAL_MINUTES=360`
-- `AKSHARE_NEWS_INTERVAL_MINUTES=180`
-- `YAHOO_FINANCE_ENABLED=true`
-- `YAHOO_HISTORY_RANGE=2y`
-- `YAHOO_HISTORY_INTERVAL=1d`
-- `YAHOO_CN_INDEX_SYMBOLS=000001.SS,399001.SZ,399006.SZ,000300.SS,000905.SS,000852.SS,000688.SS`
-- `YAHOO_CN_SYMBOLS=600519.SS,000001.SZ,300750.SZ,300059.SZ,688981.SS,...`
-- `YAHOO_US_SYMBOLS=AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA,AVGO,AMD,ASML,TSM,...`
-- `YAHOO_CN_INDEX_INTERVAL_MINUTES=360`
-- `YAHOO_CN_EQUITY_INTERVAL_MINUTES=360`
-- `YAHOO_US_EQUITY_INTERVAL_MINUTES=360`
-- `YAHOO_DAILY_BARS_INTERVAL_MINUTES=360`
-- `SEC_EDGAR_ENABLED=true`
-- `SEC_EDGAR_TICKERS=AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA,AVGO,AMD,INTC,MU,ORCL,CRM,JPM,BAC,GS,XOM,CVX,UNH,LLY,PFE,COST,WMT,MCD`
-- `SEC_EDGAR_FILINGS_PER_TICKER=12`
-- `SEC_EDGAR_INTERVAL_MINUTES=360`
-- `SEC_EDGAR_USER_AGENT=market-dashboard/2.0 contact=admin@market.heyrickishere.com`
-- `SEC_EDGAR_REQUEST_DELAY_SECONDS=0.12`
-- `SEC_EDGAR_FETCH_FILING_TEXT=true`
-- `SEC_EDGAR_TEXT_FILINGS_PER_TICKER=4`
-- `SEC_EDGAR_FILING_TEXT_MAX_CHARS=12000`
-- `FORCE_MARKET_SYNC=false`
+Important tables:
 
-SEC asks automated clients to identify themselves. Replace the default `SEC_EDGAR_USER_AGENT` contact with a real contact address before production use.
+- `portfolio_import_batches` — one row per accepted upload batch.
+- `portfolio_positions` — normalized current holdings for each batch.
+- `portfolio_transactions` — workbook transaction records.
+- `portfolio_closed_positions` — closed position history.
+- `portfolio_asset_allocation` — computed asset buckets.
+- `portfolio_risk_metrics` — deterministic concentration and exposure metrics.
+- `portfolio_underlying_holdings` — lookthrough/proxy underlying holdings.
+- `portfolio_industry_allocations` — industry/theme exposure.
+- `portfolio_login_failures` — login lockout tracking.
 
-## Local bootstrap outline
+## Runtime Data
 
-1. Copy `.env.example` to `/etc/market-dashboard.env` and set passwords.
-2. Install Docker, Docker Compose v2, Python venv support.
-3. Create `.venv` and install `requirements.txt`.
-4. `docker compose --env-file /etc/market-dashboard.env up -d`
-5. Run the sync once.
-6. Install the systemd timer and nginx config.
-7. Add DNS for `market.heyrickishere.com` and issue a cert with certbot.
+These paths are deployment examples and should not be committed with real data:
 
-## Validation queries
+- PostgreSQL volume: `/www/market-dashboard-data/postgres`
+- Uploaded files: `/var/lib/portfolio-app/uploads`
+- Environment file: `.env.deploy` or `.env`
+
+Both `.env` and `.env.deploy` are ignored by Git.
+
+## Configuration
+
+Copy `.env.example` to `.env.deploy` or `.env` and set private values:
 
 ```bash
-docker exec market-dashboard-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT source, ok, message, latest_observation_ts, last_run FROM data_sync_status ORDER BY source;"
-
-docker exec market-dashboard-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT provider, category, count(*) FROM data_asset_catalog GROUP BY provider, category ORDER BY provider, category;"
-
-docker exec market-dashboard-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT source, category, count(*) FROM market_text_records GROUP BY source, category ORDER BY source, category;"
-
-docker exec market-dashboard-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT status, title, model, generated_at FROM agent_reports ORDER BY generated_at DESC LIMIT 5;"
+POSTGRES_DB=market
+POSTGRES_USER=market
+POSTGRES_PASSWORD=change-me
+PORTFOLIO_ADMIN_USERNAME=admin
+PORTFOLIO_ADMIN_PASSWORD=change-me
+PORTFOLIO_SESSION_SECRET=change-me
+MARKET_DATA_ROOT=/www/market-dashboard-data
+PORTFOLIO_DATA_ROOT=/var/lib/portfolio-app
+PORTFOLIO_HTTP_PORT=8001
+PORTFOLIO_AKSHARE_ENABLED=false
+PORTFOLIO_MAX_UPLOAD_BYTES=26214400
+PORTFOLIO_LOGIN_FAILURE_LIMIT=5
+PORTFOLIO_LOGIN_LOCKOUT_MINUTES=30
 ```
+
+Do not commit real passwords, cookies, uploaded files, or portfolio exports.
+
+## Common Commands
+
+```bash
+docker compose --env-file .env.deploy ps
+docker compose --env-file .env.deploy up -d --build
+docker compose --env-file .env.deploy logs --tail=100 portfolio-app
+docker compose --env-file .env.deploy restart portfolio-app
+docker compose --env-file .env.deploy exec postgres psql -U market -d market
+```
+
+## Validation Checklist
+
+- Upload several `.xlsx` files and confirm each accepted file has a separate batch.
+- Re-upload the same file and confirm it is rejected without adding a DB row or copied file.
+- Replace one batch with a corrected file and confirm the batch id stays stable.
+- Confirm `/api/portfolio/latest` uses the newest `as_of_date`.
+- Confirm `/timeline`, `/uploads`, `/reports/{batch_id}`, and `/compare` require login.
+- Confirm `/api/analytics/timeline` and `/api/analytics/xray` return JSON after login.

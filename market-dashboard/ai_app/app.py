@@ -1,240 +1,246 @@
 from __future__ import annotations
 
-import os
-import json
+import hashlib
+import hmac
 import html
-import re
-import uuid
+import json
+import os
+import secrets
+import shutil
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
-import psycopg2
-import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse
 from psycopg2.extras import Json, RealDictCursor
 
+from providers import portfolio
+from providers.store import connect_db, ensure_schema
+from sync_portfolio_data import (
+    clear_batch,
+    collect_market_data,
+    enrich_positions,
+    insert_allocations,
+    insert_closed_positions,
+    insert_fund_metadata,
+    insert_industries,
+    insert_positions,
+    insert_risk_metrics,
+    insert_transactions,
+    insert_underlying,
+)
 
-APP_ROOT = os.path.dirname(__file__)
-STOP_TICKERS = {"AI", "API", "ETF", "SEC", "GDP", "CPI", "FRED", "USD", "A股", "OK"}
+APP_TITLE = "Ricky Portfolio"
+COOKIE_NAME = "portfolio_session"
+MAX_UPLOAD_BYTES = int(os.getenv("PORTFOLIO_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+UPLOAD_ROOT = Path(os.getenv("PORTFOLIO_UPLOAD_ROOT", "/var/lib/portfolio-app/uploads"))
+ADMIN_USERNAME = os.getenv("PORTFOLIO_ADMIN_USERNAME") or os.getenv("GRAFANA_ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("PORTFOLIO_ADMIN_PASSWORD") or os.getenv("GRAFANA_ADMIN_PASSWORD", "")
+SESSION_SECRET = (os.getenv("PORTFOLIO_SESSION_SECRET") or os.getenv("POSTGRES_PASSWORD") or "change-me").encode()
+AKSHARE_ENABLED = os.getenv("PORTFOLIO_AKSHARE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+LOGIN_FAILURE_LIMIT = int(os.getenv("PORTFOLIO_LOGIN_FAILURE_LIMIT", "5"))
+LOGIN_LOCKOUT_MINUTES = int(os.getenv("PORTFOLIO_LOGIN_LOCKOUT_MINUTES", "30"))
+
+app = FastAPI(title=APP_TITLE)
 
 
-def env(name: str, default: str | None = None) -> str:
-    value = os.getenv(name, default)
-    if value is None or value == "":
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @contextmanager
-def db():
-    conn = psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        dbname=env("POSTGRES_DB"),
-        user=env("POSTGRES_USER"),
-        password=env("POSTGRES_PASSWORD"),
-    )
+def db_conn():
+    conn = connect_db()
     try:
         yield conn
     finally:
         conn.close()
 
 
-def rows(sql: str, params: tuple[Any, ...] = ()):
-    with db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+def rows(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    with db_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, params)
         return [dict(row) for row in cur.fetchall()]
 
 
-def one(sql: str, params: tuple[Any, ...] = ()):
+def one(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
     result = rows(sql, params)
     return result[0] if result else None
 
 
-def iso(value):
-    if isinstance(value, datetime):
-        return value.astimezone(timezone.utc).isoformat()
-    if isinstance(value, date):
+def execute(sql: str, params: tuple[Any, ...] = ()) -> None:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        conn.commit()
+
+
+def ensure_portfolio_schema() -> None:
+    with db_conn() as conn:
+        ensure_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                ALTER TABLE portfolio_import_batches
+                    ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    ADD COLUMN IF NOT EXISTS original_filename TEXT,
+                    ADD COLUMN IF NOT EXISTS file_sha256 TEXT,
+                    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'complete',
+                    ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS total_assets NUMERIC(20, 6),
+                    ADD COLUMN IF NOT EXISTS position_count INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS report_markdown TEXT NOT NULL DEFAULT '';
+
+                CREATE INDEX IF NOT EXISTS idx_portfolio_batches_uploaded
+                    ON portfolio_import_batches (uploaded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_portfolio_batches_status_archived
+                    ON portfolio_import_batches (status, is_archived, uploaded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_portfolio_batches_sha
+                    ON portfolio_import_batches (file_sha256);
+
+                CREATE TABLE IF NOT EXISTS portfolio_login_failures (
+                    failure_key TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    client_ip TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    locked_until TIMESTAMPTZ,
+                    last_failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_portfolio_login_failures_locked
+                    ON portfolio_login_failures (locked_until);
+                """
+            )
+        conn.commit()
+
+
+@app.on_event("startup")
+def startup() -> None:
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    ensure_portfolio_schema()
+
+
+def sign(value: str) -> str:
+    return hmac.new(SESSION_SECRET, value.encode(), hashlib.sha256).hexdigest()
+
+
+def make_session(username: str) -> str:
+    payload = json.dumps(
+        {"u": username, "t": int(now_utc().timestamp()), "n": secrets.token_hex(8)},
+        separators=(",", ":"),
+    )
+    return f"{payload}.{sign(payload)}"
+
+
+def session_user(request: Request) -> str | None:
+    token = request.cookies.get(COOKIE_NAME)
+    if not token or "." not in token:
+        return None
+    payload, sig = token.rsplit(".", 1)
+    if not hmac.compare_digest(sign(payload), sig):
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return str(data.get("u")) if data.get("u") == ADMIN_USERNAME else None
+
+
+def require_user(request: Request) -> str:
+    user = session_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+def login_failure_key(username: str, ip: str) -> str:
+    return hashlib.sha256(f"{username}|{ip}".encode()).hexdigest()
+
+
+def current_login_lock(username: str, ip: str) -> dict[str, Any] | None:
+    return one(
+        """
+        SELECT attempts, locked_until
+        FROM portfolio_login_failures
+        WHERE failure_key = %s AND locked_until IS NOT NULL AND locked_until > NOW()
+        """,
+        (login_failure_key(username, ip),),
+    )
+
+
+def record_login_failure(username: str, ip: str) -> dict[str, Any]:
+    key = login_failure_key(username, ip)
+    existing = one("SELECT attempts FROM portfolio_login_failures WHERE failure_key = %s", (key,))
+    attempts = int(existing["attempts"] if existing else 0) + 1
+    locked_until = now_utc() + timedelta(minutes=LOGIN_LOCKOUT_MINUTES) if attempts >= LOGIN_FAILURE_LIMIT else None
+    with db_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO portfolio_login_failures
+                (failure_key, username, client_ip, attempts, locked_until, last_failed_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (failure_key) DO UPDATE SET
+                attempts = EXCLUDED.attempts,
+                locked_until = EXCLUDED.locked_until,
+                last_failed_at = NOW()
+            RETURNING attempts, locked_until
+            """,
+            (key, username, ip, attempts, locked_until),
+        )
+        row = dict(cur.fetchone())
+        conn.commit()
+        return row
+
+
+def clear_login_failures(username: str, ip: str) -> None:
+    execute("DELETE FROM portfolio_login_failures WHERE failure_key = %s", (login_failure_key(username, ip),))
+
+
+def redirect_if_guest(request: Request):
+    return None if session_user(request) else RedirectResponse("/login", status_code=303)
+
+
+def json_ready(value: Any) -> Any:
+    if isinstance(value, list):
+        return [json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {key: json_ready(item) for key, item in value.items()}
+    if isinstance(value, (datetime, date)):
         return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
     return value
 
 
-def serialize(items):
-    for item in items:
-        for key, value in list(item.items()):
-            item[key] = iso(value)
-    return items
+def esc(value: Any) -> str:
+    return html.escape("" if value is None else str(value))
 
 
-def latest_status():
-    return serialize(
-        rows(
-            """
-            SELECT source, ok, message, latest_observation_ts, last_run,
-                   ROUND(EXTRACT(EPOCH FROM (last_run - latest_observation_ts)) / 3600, 1) AS lag_hours
-            FROM data_sync_status
-            WHERE source <> 'fredgraph'
-            ORDER BY source
-            """
-        )
-    )
+def money(value: Any, signed: bool = False) -> str:
+    if value is None:
+        return "-"
+    number = float(value)
+    prefix = "+" if signed and number >= 0 else ""
+    return f"{prefix}¥{number:,.2f}"
 
 
-def market_summary():
-    return {
-        "latest_report": latest_report(),
-        "status": latest_status(),
-        "cn_indices": serialize(
-            rows(
-                """
-                SELECT asset_key, asset_name, value, change, change_percent, ts, updated_at
-                FROM market_asset_snapshot
-                WHERE category = 'cn_indices'
-                ORDER BY asset_name
-                """
-            )
-        ),
-        "cn_quotes": serialize(
-            rows(
-                """
-                SELECT asset_key, asset_name, value, change_percent, ts, meta_json
-                FROM market_asset_snapshot
-                WHERE category = 'cn_equity_quote'
-                ORDER BY ABS(COALESCE(change_percent, 0)) DESC, asset_name
-                LIMIT 18
-                """
-            )
-        ),
-        "us_equities": serialize(
-            rows(
-                """
-                SELECT asset_key, asset_name, regexp_replace(asset_key, '^YFUS:', '') AS source_symbol,
-                       value, change_percent, ts, meta_json
-                FROM market_asset_snapshot
-                WHERE category = 'us_equity_daily'
-                ORDER BY ABS(COALESCE(change_percent, 0)) DESC, asset_name
-                LIMIT 18
-                """
-            )
-        ),
-        "fund_flow": serialize(
-            rows(
-                """
-                SELECT asset_key, asset_name, value, ts
-                FROM market_asset_snapshot
-                WHERE category = 'cn_fund_flow'
-                ORDER BY value DESC
-                LIMIT 12
-                """
-            )
-        ),
-        "market_flow": serialize(
-            rows(
-                """
-                SELECT asset_key, asset_name, value, ts
-                FROM market_asset_snapshot
-                WHERE category = 'cn_market_fund_flow'
-                ORDER BY ts DESC
-                LIMIT 8
-                """
-            )
-        ),
-        "concepts": serialize(
-            rows(
-                """
-                SELECT asset_key, asset_name, value, change_percent, ts, meta_json
-                FROM market_asset_snapshot
-                WHERE category = 'cn_concept'
-                ORDER BY ABS(COALESCE((meta_json->>'change_percent')::double precision, change_percent, 0)) DESC
-                LIMIT 18
-                """
-            )
-        ),
-        "cn_text_evidence": serialize(
-            rows(
-                """
-                SELECT asset_name, category, ts, title, body, url, meta_json
-                FROM market_text_records
-                WHERE source = 'akshare'
-                  AND category IN ('cn_company_news', 'cn_financial_indicator', 'cn_industry_constituents', 'cn_company_announcement')
-                ORDER BY ts DESC
-                LIMIT 24
-                """
-            )
-        ),
-        "sec_filings": serialize(
-            rows(
-                """
-                SELECT asset_name, source_symbol, ts, title, url, meta_json
-                FROM market_text_records
-                WHERE source = 'sec_edgar'
-                ORDER BY ts DESC
-                LIMIT 12
-                """
-            )
-        ),
-        "asset_counts": rows(
-            """
-            SELECT provider, category, count(*) AS rows, max(latest_observation_ts) AS latest
-            FROM data_asset_catalog
-            GROUP BY provider, category
-            ORDER BY provider, category
-            """
-        ),
-    }
+def pct(value: Any, signed: bool = False) -> str:
+    if value is None:
+        return "-"
+    number = float(value)
+    prefix = "+" if signed and number >= 0 else ""
+    return f"{prefix}{number * 100:.2f}%"
 
 
-def ai_context():
-    data = market_summary()
-    return {
-        "latest_report": data.get("latest_report"),
-        "status": data["status"],
-        "cn_indices": data["cn_indices"],
-        "active_cn_quotes": data["cn_quotes"],
-        "us_equity_daily": data["us_equities"],
-        "cn_fund_flow": data["fund_flow"],
-        "cn_market_fund_flow": data["market_flow"],
-        "cn_concepts": data["concepts"],
-        "cn_text_evidence": data["cn_text_evidence"],
-        "sec_filings": data["sec_filings"],
-        "asset_counts": serialize(data["asset_counts"]),
-    }
-
-
-def latest_report():
-    report = one(
-        """
-        SELECT report_id, report_type, status, title, summary, stance, confidence,
-               recommendations, risks, watchlist, model, generated_at, data_as_of, error_message
-        FROM agent_reports
-        WHERE report_type = 'market_research_v1'
-        ORDER BY generated_at DESC
-        LIMIT 1
-        """
-    )
-    if not report:
-        return None
-    report = serialize([report])[0]
-    report["evidence"] = serialize(
-        rows(
-            """
-            SELECT evidence_type, title, detail, source, asset_key, ts, url
-            FROM agent_report_evidence
-            WHERE report_id = %s
-            ORDER BY evidence_type, ts DESC NULLS LAST
-            LIMIT 18
-            """,
-            (report["report_id"],),
-        )
-    )
-    return report
-
-
-def fmt_dt(value):
+def fmt_dt(value: Any) -> str:
     if not value:
         return "-"
     if isinstance(value, str):
@@ -245,1369 +251,1120 @@ def fmt_dt(value):
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def fmt_num(value, digits=2):
-    if value is None:
+def fmt_date(value: Any) -> str:
+    if not value:
         return "-"
-    return f"{float(value):,.{digits}f}"
+    return value[:10] if isinstance(value, str) else value.isoformat()
 
 
-def fmt_pct(value):
-    if value is None:
-        return "-"
-    return f"{float(value):+.2f}%"
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def money_cn(value):
-    if value is None:
-        return "-"
-    value = float(value)
-    if abs(value) >= 100_000_000:
-        return f"{value / 100_000_000:+,.2f} 亿"
-    if abs(value) >= 10_000:
-        return f"{value / 10_000:+,.2f} 万"
-    return f"{value:+,.0f}"
+def safe_filename(name: str) -> str:
+    out = [char if char.isalnum() or char in {".", "-", "_"} else "_" for char in name]
+    return "".join(out).strip("._") or "portfolio.xlsx"
 
 
-def status_label(ok):
-    return "OK" if ok else "同步失败"
+def make_batch_id(uploaded_at: datetime, digest: str) -> str:
+    stamp = uploaded_at.strftime("%Y%m%dT%H%M%S") + f"{uploaded_at.microsecond:06d}Z"
+    return f"portfolio-{stamp}-{digest[:12]}"
 
 
-def status_card_class(item):
-    message = item.get("message") or ""
-    if not item.get("ok"):
-        return "bad"
-    if message.startswith("Using cached data"):
-        return "stale"
-    return ""
+def batch_link(batch_id: str) -> str:
+    return f"/reports/{batch_id}"
 
 
-def status_text(item):
-    message = item.get("message") or ""
-    if message.startswith("Using cached data"):
-        return "使用缓存"
-    return status_label(item.get("ok"))
+SUCCESS_STATUSES = ("complete", "partial")
 
 
-def esc(value):
-    return html.escape("" if value is None else str(value))
-
-
-def pill_class(status):
-    if status == "ok":
-        return "ok"
-    if status == "needs_config":
-        return "warn"
-    return "bad"
-
-
-def list_items(values):
-    if not values:
-        return "<li>No items yet.</li>"
-    return "\n".join(f"<li>{esc(value)}</li>" for value in values)
-
-
-def quote_change(item):
-    meta = item.get("meta_json")
-    if not isinstance(meta, dict):
-        meta = {}
-    return meta.get("change_percent")
-
-
-def json_ready(value):
-    if isinstance(value, datetime):
-        return value.astimezone(timezone.utc).isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, list):
-        return [json_ready(item) for item in value]
-    if isinstance(value, dict):
-        return {key: json_ready(item) for key, item in value.items()}
-    return value
-
-
-def normalize_symbol(token: str) -> list[str]:
-    token = token.strip().upper().replace(".SH", ".SS")
-    if re.fullmatch(r"\d{6}", token):
-        if token.startswith(("5", "6", "9")):
-            return [f"{token}.SS"]
-        return [f"{token}.SZ"]
-    if re.fullmatch(r"\d{6}\.(SS|SZ)", token):
-        return [token]
-    if re.fullmatch(r"[A-Z]{1,5}", token) and token not in STOP_TICKERS:
-        return [token]
-    return []
-
-
-def canonical_cn_asset_key(source_symbol: str) -> str | None:
-    if source_symbol.endswith((".SS", ".SZ")) and re.fullmatch(r"\d{6}\.(SS|SZ)", source_symbol):
-        return f"CN:{source_symbol[:6]}"
-    return None
-
-
-def search_assets(query: str, limit: int = 20):
-    query = query.strip()
-    if not query:
-        return []
-    pattern = f"%{query}%"
-    symbols = [symbol.upper() for token in re.findall(r"\b\d{6}(?:\.(?:SS|SZ|SH))?\b|\b[A-Z]{1,5}\b", query.upper()) for symbol in normalize_symbol(token)]
-    return serialize(
-        rows(
-            """
-            WITH alias_hits AS (
-                SELECT DISTINCT asset_key, source_symbol, market, provider, alias, alias_type
-                FROM asset_aliases
-                WHERE alias ILIKE %s OR source_symbol ILIKE %s OR upper(source_symbol) = ANY(%s)
-            ),
-            catalog_hits AS (
-                SELECT DISTINCT asset_key, source_symbol, market, provider, asset_name, category
-                FROM data_asset_catalog
-                WHERE asset_name ILIKE %s OR source_symbol ILIKE %s OR upper(source_symbol) = ANY(%s)
-            ),
-            merged AS (
-                SELECT
-                    asset_key,
-                    alias AS asset_name,
-                    market,
-                    provider,
-                    source_symbol,
-                    NULL::text AS category,
-                    alias,
-                    alias_type
-                FROM alias_hits
-                UNION ALL
-                SELECT
-                    asset_key,
-                    asset_name,
-                    market,
-                    provider,
-                    source_symbol,
-                    category,
-                    NULL::text AS alias,
-                    NULL::text AS alias_type
-                FROM catalog_hits
-            )
-            SELECT asset_key,
-                   max(asset_name) AS asset_name,
-                   max(market) AS market,
-                   max(provider) AS provider,
-                   max(source_symbol) AS source_symbol,
-                   max(category) AS category,
-                   array_agg(DISTINCT alias) FILTER (WHERE alias IS NOT NULL) AS matched_aliases
-            FROM merged
-            GROUP BY asset_key
-            ORDER BY max(market), max(source_symbol)
-            LIMIT %s
-            """,
-            (pattern, pattern, symbols or [""], pattern, pattern, symbols or [""], limit),
-        )
-    )
-
-
-def detect_assets(question: str):
-    raw_tokens = set(re.findall(r"\b\d{6}(?:\.(?:SS|SZ|SH))?\b|\b[A-Z]{1,5}\b", question.upper()))
-    symbols = sorted({symbol for token in raw_tokens for symbol in normalize_symbol(token)})
-    aliases = rows(
+def latest_batch() -> dict[str, Any] | None:
+    return one(
         """
-        SELECT alias, asset_key, source_symbol, market, alias_type, provider
-        FROM asset_aliases
-        ORDER BY length(alias) DESC
-        LIMIT 1000
+        SELECT * FROM portfolio_import_batches
+        WHERE status IN ('complete', 'partial')
+        ORDER BY as_of_date DESC, uploaded_at DESC, batch_id DESC
+        LIMIT 1
         """
     )
-    alias_matches = []
-    alias_asset_keys = []
-    question_upper = question.upper()
-    for item in aliases:
-        alias = str(item.get("alias") or "")
-        if not alias:
-            continue
-        if alias.upper() in question_upper or alias in question:
-            alias_matches.append(item)
-            alias_asset_keys.append(item["asset_key"])
-            if item.get("source_symbol"):
-                symbols.append(str(item["source_symbol"]).upper())
-    symbols = sorted(set(symbols))
-    catalog = rows(
-        """
-        SELECT asset_key, asset_name, market, category, provider, source_symbol, latest_observation_ts
-        FROM data_asset_catalog
-        WHERE provider IN ('yahoo_finance', 'akshare', 'sec_edgar')
-        ORDER BY latest_observation_ts DESC NULLS LAST
-        LIMIT 500
-        """
-    )
-    matched = []
-    seen = set()
-    for item in catalog:
-        source_symbol = str(item.get("source_symbol") or "").upper()
-        asset_name = str(item.get("asset_name") or "")
-        if (
-            item.get("asset_key") in alias_asset_keys
-            or source_symbol in symbols
-            or (asset_name and asset_name in question)
-            or (source_symbol and source_symbol in question_upper)
-        ):
-            key = (item["provider"], item["category"], item["asset_key"])
-            if key not in seen:
-                matched.append(item)
-                seen.add(key)
-    if not matched and symbols:
-        matched = rows(
-            """
-            SELECT asset_key, asset_name, market, category, provider, source_symbol, latest_observation_ts
-            FROM data_asset_catalog
-            WHERE upper(source_symbol) = ANY(%s)
-            ORDER BY latest_observation_ts DESC NULLS LAST
-            LIMIT 20
-            """,
-            (symbols,),
-        )
-    for item in matched:
-        item["matched_aliases"] = [
-            alias["alias"]
-            for alias in alias_matches
-            if alias["asset_key"] == item["asset_key"] or alias["source_symbol"] == item.get("source_symbol")
-        ][:6]
-    return matched[:16], symbols
 
 
-def summarize_bars(source_symbol: str):
-    bar_rows = rows(
-        """
-        SELECT asset_key, asset_name, market, category, source_symbol, ts, open, high, low, close, adj_close, volume
-        FROM daily_bars
-        WHERE upper(source_symbol) = upper(%s)
-        ORDER BY ts DESC
-        LIMIT 130
-        """,
-        (source_symbol,),
-    )
-    if not bar_rows:
+def previous_success(batch_id: str) -> dict[str, Any] | None:
+    current = one("SELECT as_of_date, uploaded_at, batch_id FROM portfolio_import_batches WHERE batch_id = %s", (batch_id,))
+    if not current:
         return None
-    ordered = list(reversed(bar_rows))
-    closes = [float(item["close"]) for item in ordered if item.get("close") is not None]
-    latest = ordered[-1]
-
-    def pct(days: int):
-        if len(closes) <= days or closes[-days - 1] == 0:
-            return None
-        return (closes[-1] / closes[-days - 1] - 1) * 100
-
-    return {
-        "asset_key": latest["asset_key"],
-        "asset_name": latest["asset_name"],
-        "market": latest["market"],
-        "source_symbol": latest["source_symbol"],
-        "latest_date": latest["ts"],
-        "latest_close": latest["close"],
-        "latest_volume": latest["volume"],
-        "return_5d_pct": pct(5),
-        "return_20d_pct": pct(20),
-        "return_60d_pct": pct(60),
-        "recent_bars": ordered[-20:],
-    }
-
-
-def text_evidence_for_assets(asset_keys: list[str], source_symbols: list[str], limit: int = 30):
-    if not asset_keys and not source_symbols:
-        return []
-    return serialize(
-        rows(
-            """
-            SELECT evidence_id, evidence_type, asset_key, asset_name, market, source, source_symbol,
-                   ts, title, url, summary, body_excerpt, meta_json
-            FROM evidence_items
-            WHERE asset_key = ANY(%s) OR upper(source_symbol) = ANY(%s)
-            ORDER BY ts DESC NULLS LAST
-            LIMIT %s
-            """,
-            (asset_keys or [""], [symbol.upper() for symbol in source_symbols] or [""], limit),
-        )
-    )
-
-
-def macro_context():
-    return serialize(
-        rows(
-            """
-            SELECT asset_key, asset_name, category, value, change_percent, ts
-            FROM market_asset_snapshot
-            WHERE category IN ('rates', 'credit', 'commodities', 'fx', 'macro', 'liquidity', 'shipping')
-            ORDER BY category, asset_key
-            LIMIT 80
-            """
-        )
-    )
-
-
-def build_agent_trace(question: str, detected_assets: list[dict], daily: list[dict], evidence: list[dict], macro: list[dict]):
-    return {
-        "IntentAgent": {
-            "question": question,
-            "assets": [
-                {
-                    "asset_key": item.get("asset_key"),
-                    "asset_name": item.get("asset_name"),
-                    "source_symbol": item.get("source_symbol"),
-                    "market": item.get("market"),
-                    "matched_aliases": item.get("matched_aliases") or [],
-                }
-                for item in detected_assets
-            ],
-        },
-        "MarketDataAgent": {"daily_bars_summary": daily},
-        "MacroAgent": {"macro_cross_asset": macro},
-        "FundamentalAgent": {
-            "fundamental_evidence": [
-                item for item in evidence if item.get("evidence_type") in {"cn_financial", "sec_filing"}
-            ][:12]
-        },
-        "NewsFilingAgent": {
-            "news_and_filings": [
-                item for item in evidence if item.get("evidence_type") in {"cn_news", "cn_announcement", "sec_filing"}
-            ][:20]
-        },
-        "RiskAgent": {
-            "required_sections": ["风险", "数据缺口", "反方观点"],
-            "constraints": ["不提供仓位比例", "不承诺收益", "引用证据日期"],
-        },
-    }
-
-
-def build_question_context(question: str):
-    detected_assets, symbols = detect_assets(question)
-    source_symbols = sorted({item["source_symbol"] for item in detected_assets if item.get("source_symbol")})
-    if not source_symbols and symbols:
-        source_symbols = symbols[:8]
-    daily = [summary for symbol in source_symbols for summary in [summarize_bars(symbol)] if summary]
-    asset_keys = [item["asset_key"] for item in detected_assets]
-    for symbol in source_symbols:
-        if symbol.endswith((".SS", ".SZ")):
-            asset_keys.append(f"CN:{symbol[:6]}")
-    asset_keys = sorted(set(asset_keys))
-    related_text = text_evidence_for_assets(asset_keys, source_symbols, 32)
-    macro = macro_context()
-    status = latest_status()
-    inventory = rows(
+    return one(
         """
-        SELECT provider, category, count(*) AS assets, max(latest_observation_ts) AS latest
-        FROM data_asset_catalog
-        GROUP BY provider, category
-        ORDER BY provider, category
-        """
-    )
-    agent_trace = build_agent_trace(question, detected_assets, daily, related_text, macro)
-    return {
-        "question": question,
-        "agent_trace": agent_trace,
-        "detected_symbols": symbols,
-        "matched_assets": detected_assets,
-        "daily_bars_summary": daily,
-        "related_text_evidence": related_text,
-        "macro_cross_asset": macro,
-        "data_status": status,
-        "data_inventory": inventory,
-    }
-
-
-def save_qa(question: str, answer: str, model: str | None, ok: bool, context: dict[str, Any], error_message: str | None = None):
-    try:
-        with db() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO agent_question_answers
-                    (qa_id, question, answer, model, ok, context_json, error_message, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-                """,
-                (
-                    f"qa:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}:{uuid.uuid4().hex[:8]}",
-                    question,
-                    answer,
-                    model,
-                    ok,
-                    Json(json_ready(context)),
-                    error_message,
-                ),
-            )
-            conn.commit()
-    except Exception:
-        pass
-
-
-def ask_model(question: str):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return {
-            "ok": False,
-            "answer": "还没有配置模型 API Key。请在服务器环境里设置 OPENAI_API_KEY。",
-            "model": None,
-        }
-    question = question.strip()
-    if not question:
-        return {"ok": False, "answer": "请输入一个问题。", "model": None}
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    research_context = build_question_context(question)
-    context = json.dumps(json_ready(research_context), ensure_ascii=False)[:60000]
-    response = requests.post(
-        f"{base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是一个中文金融研究 Agent。只能基于提供的数据回答。"
-                        "必须按固定结构输出：结论、关键事实、推断、风险、数据缺口、证据列表、非投资建议声明。"
-                        "证据列表必须包含来源、标题、日期、证据类型、URL（如有）。"
-                        "如果数据不足，请明确说数据不足，并说明还需要什么。"
-                        "不要给实盘下单指令、仓位比例或保证收益。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"问题：{question}\n\n可用数据：\n{context}",
-                },
-            ],
-            "temperature": float(os.getenv("AGENT_TEMPERATURE", "0.2")),
-        },
-        timeout=int(os.getenv("AGENT_LLM_TIMEOUT_SECONDS", "90")),
-    )
-    response.raise_for_status()
-    payload = response.json()
-    answer = payload["choices"][0]["message"]["content"]
-    save_qa(question, answer, model, True, research_context)
-    return {"ok": True, "answer": answer, "model": model}
-
-
-def resolve_asset_query(symbol_or_query: str):
-    matches = search_assets(symbol_or_query, 8)
-    if matches:
-        return matches[0]
-    normalized = normalize_symbol(symbol_or_query)
-    if normalized:
-        symbol = normalized[0]
-        return one(
-            """
-            SELECT asset_key, asset_name, market, provider, source_symbol, category
-            FROM data_asset_catalog
-            WHERE upper(source_symbol) = upper(%s)
-            ORDER BY latest_observation_ts DESC NULLS LAST
-            LIMIT 1
-            """,
-            (symbol,),
-        )
-    return None
-
-
-def asset_summary(symbol_or_query: str):
-    asset = resolve_asset_query(symbol_or_query)
-    if not asset:
-        return {"ok": False, "message": "没有找到匹配资产", "query": symbol_or_query}
-    source_symbol = asset.get("source_symbol")
-    asset_keys = [asset.get("asset_key")]
-    cn_key = canonical_cn_asset_key(source_symbol or "")
-    if cn_key:
-        asset_keys.append(cn_key)
-    bars = summarize_bars(source_symbol) if source_symbol else None
-    evidence = text_evidence_for_assets([key for key in asset_keys if key], [source_symbol] if source_symbol else [], 24)
-    fundamentals = [
-        item for item in evidence if item.get("evidence_type") in {"cn_financial", "sec_filing"}
-    ][:10]
-    return {
-        "ok": True,
-        "asset": serialize([asset])[0],
-        "daily_bars_summary": json_ready(bars),
-        "evidence": evidence,
-        "fundamentals": fundamentals,
-        "macro": macro_context(),
-    }
-
-
-app = FastAPI(title="Market AI Research", root_path="/ai")
-app.mount("/static", StaticFiles(directory=os.path.join(APP_ROOT, "static")), name="static")
-
-
-@app.get("/api/health")
-def health():
-    db_ok = one("SELECT NOW() AS now")
-    return {"ok": bool(db_ok), "db_time": iso(db_ok["now"]) if db_ok else None}
-
-
-@app.get("/api/data-status")
-def data_status():
-    return latest_status()
-
-
-@app.get("/api/summary")
-def summary():
-    data = market_summary()
-    data["asset_counts"] = serialize(data["asset_counts"])
-    return data
-
-
-@app.get("/api/reports/latest")
-def latest_report_api():
-    return latest_report() or {"status": "missing", "message": "No report has been generated yet."}
-
-
-@app.get("/api/assets/search")
-def assets_search(request: Request):
-    query = str(request.query_params.get("q") or "").strip()
-    limit = max(1, min(int(request.query_params.get("limit") or 30), 80))
-    return {"query": query, "items": search_assets(query, limit)}
-
-
-@app.get("/api/assets/{symbol}/summary")
-def asset_summary_api(symbol: str):
-    return asset_summary(symbol)
-
-
-@app.get("/api/qa/recent")
-def recent_qa():
-    return serialize(
-        rows(
-            """
-            SELECT qa_id, question, model, ok, error_message, created_at
-            FROM agent_question_answers
-            ORDER BY created_at DESC
-            LIMIT 20
-            """
-        )
-    )
-
-
-@app.get("/api/qa/{qa_id}")
-def qa_detail(qa_id: str):
-    item = one(
-        """
-        SELECT qa_id, question, answer, model, ok, error_message, context_json, created_at
-        FROM agent_question_answers
-        WHERE qa_id = %s
+        SELECT * FROM portfolio_import_batches
+        WHERE status IN ('complete', 'partial')
+          AND (as_of_date, uploaded_at, batch_id) < (%s, %s, %s)
+        ORDER BY as_of_date DESC, uploaded_at DESC, batch_id DESC
+        LIMIT 1
         """,
-        (qa_id,),
+        (current["as_of_date"], current["uploaded_at"], current["batch_id"]),
     )
-    if not item:
-        return {"ok": False, "message": "没有找到这条问答"}
-    context = item.get("context_json") if isinstance(item.get("context_json"), dict) else {}
-    item["context_summary"] = {
-        "matched_assets": (context.get("matched_assets") or [])[:12],
-        "related_text_evidence": (context.get("related_text_evidence") or [])[:18],
-        "detected_symbols": context.get("detected_symbols") or [],
-    }
-    item.pop("context_json", None)
-    return {"ok": True, "item": json_ready(serialize([item])[0])}
 
 
-@app.get("/api/evidence/search")
-def evidence_search(request: Request):
-    query = str(request.query_params.get("q") or "").strip()
-    if not query:
-        return {"query": query, "items": []}
-    pattern = f"%{query}%"
-    limit = max(1, min(int(request.query_params.get("limit") or 40), 100))
-    items = rows(
+def list_batches(limit: int = 120) -> list[dict[str, Any]]:
+    return rows(
         """
-        SELECT evidence_id, evidence_type, asset_key, asset_name, market, source, source_symbol, ts,
-               title, url, summary, body_excerpt, meta_json
-        FROM evidence_items
-        WHERE title ILIKE %s OR body_excerpt ILIKE %s OR summary ILIKE %s
-           OR asset_name ILIKE %s OR source_symbol ILIKE %s
-        ORDER BY ts DESC
+        SELECT batch_id, uploaded_at, as_of_date, original_filename, file_sha256, status,
+               message, is_archived, total_assets, position_count, meta_json
+        FROM portfolio_import_batches
+        ORDER BY uploaded_at DESC, batch_id DESC
         LIMIT %s
         """,
-        (pattern, pattern, pattern, pattern, pattern, limit),
+        (limit,),
     )
-    aliases = rows(
-        """
-        SELECT alias, asset_key, source_symbol, market, alias_type, provider
-        FROM asset_aliases
-        WHERE alias ILIKE %s OR source_symbol ILIKE %s
-        ORDER BY length(alias), alias
-        LIMIT 40
+
+
+def success_batches(limit: int = 80, descending: bool = False, months: int | None = None) -> list[dict[str, Any]]:
+    direction = "DESC" if descending else "ASC"
+    where = "WHERE status IN ('complete', 'partial')"
+    params: list[Any] = []
+    if months:
+        latest = one("SELECT MAX(as_of_date) AS max_date FROM portfolio_import_batches WHERE status IN ('complete', 'partial')")
+        anchor = latest.get("max_date") if latest else None
+        if anchor:
+            where += " AND as_of_date >= %s"
+            params.append(anchor - timedelta(days=max(1, months) * 31))
+    params.append(limit)
+    return rows(
+        f"""
+        SELECT batch_id, uploaded_at, as_of_date, original_filename, total_assets, position_count, status
+        FROM portfolio_import_batches
+        {where}
+        ORDER BY as_of_date {direction}, uploaded_at {direction}, batch_id {direction}
+        LIMIT %s
         """,
-        (pattern, pattern),
+        tuple(params),
     )
-    return {"query": query, "items": serialize(items), "aliases": aliases}
 
 
-@app.get("/api/evidence/{evidence_id}")
-def evidence_detail(evidence_id: str):
-    item = one(
+def find_existing_upload(digest: str) -> dict[str, Any] | None:
+    return one(
         """
-        SELECT evidence_id, evidence_type, asset_key, asset_name, market, source, source_symbol, ts,
-               title, url, summary, body_excerpt, meta_json
-        FROM evidence_items
-        WHERE evidence_id = %s
+        SELECT batch_id, as_of_date, uploaded_at, original_filename, total_assets, position_count
+        FROM portfolio_import_batches
+        WHERE file_sha256 = %s AND status IN ('complete', 'partial')
+        ORDER BY uploaded_at DESC
+        LIMIT 1
         """,
-        (evidence_id,),
+        (digest,),
     )
-    if not item:
-        return {"ok": False, "message": "没有找到这条证据"}
-    return {"ok": True, "item": json_ready(serialize([item])[0])}
 
 
-@app.post("/api/ask")
-async def ask(request: Request):
-    payload = await request.json()
-    question = str(payload.get("question") or "")
+def batch_positions(batch_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+    sql = """
+        SELECT security_code, security_name, security_type, market, holding_amount,
+               today_pnl, holding_pnl, cumulative_pnl, portfolio_weight,
+               holding_days, return_1m, return_3m, return_6m, return_1y, related_sector
+        FROM portfolio_positions
+        WHERE batch_id = %s
+        ORDER BY portfolio_weight DESC NULLS LAST, holding_amount DESC NULLS LAST
+    """
+    params: tuple[Any, ...] = (batch_id,)
+    if limit:
+        sql += " LIMIT %s"
+        params = (batch_id, limit)
+    return rows(sql, params)
+
+
+def batch_metrics(batch_id: str) -> dict[str, Any]:
+    data = rows(
+        "SELECT metric_name, metric_value FROM portfolio_risk_metrics WHERE batch_id = %s AND metric_scope = 'portfolio'",
+        (batch_id,),
+    )
+    return {item["metric_name"]: item["metric_value"] for item in data}
+
+
+def asset_allocation(batch_id: str) -> list[dict[str, Any]]:
+    return rows(
+        "SELECT allocation_bucket, amount, weight FROM portfolio_asset_allocation WHERE batch_id = %s ORDER BY weight DESC",
+        (batch_id,),
+    )
+
+
+def industry_allocation(batch_id: str) -> list[dict[str, Any]]:
+    data = rows(
+        """
+        SELECT industry_name, SUM(lookthrough_portfolio_weight) AS weight
+        FROM portfolio_industry_allocations
+        WHERE batch_id = %s
+        GROUP BY industry_name
+        ORDER BY weight DESC
+        LIMIT 12
+        """,
+        (batch_id,),
+    )
+    if data:
+        return data
+    return rows(
+        """
+        SELECT COALESCE(NULLIF(related_sector, ''), security_type, 'unknown') AS industry_name,
+               SUM(COALESCE(portfolio_weight, 0)) AS weight
+        FROM portfolio_positions
+        WHERE batch_id = %s
+        GROUP BY COALESCE(NULLIF(related_sector, ''), security_type, 'unknown')
+        ORDER BY weight DESC
+        LIMIT 12
+        """,
+        (batch_id,),
+    )
+
+
+def underlying(batch_id: str) -> list[dict[str, Any]]:
+    return rows(
+        """
+        SELECT underlying_code, underlying_name, underlying_type,
+               SUM(lookthrough_amount) AS amount,
+               SUM(lookthrough_portfolio_weight) AS weight,
+               COUNT(DISTINCT parent_code) AS source_count
+        FROM portfolio_underlying_holdings
+        WHERE batch_id = %s
+        GROUP BY underlying_code, underlying_name, underlying_type
+        ORDER BY weight DESC NULLS LAST
+        LIMIT 20
+        """,
+        (batch_id,),
+    )
+
+
+def xray_data(batch_id: str) -> dict[str, Any]:
+    batch = one("SELECT * FROM portfolio_import_batches WHERE batch_id = %s", (batch_id,))
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    under = underlying(batch_id)
+    overlaps = [item for item in under if int(item.get("source_count") or 0) > 1]
+    industry_rows = rows(
+        """
+        SELECT industry_name,
+               SUM(lookthrough_portfolio_weight) AS weight,
+               jsonb_agg(jsonb_build_object(
+                    'parent_code', parent_code,
+                    'parent_name', parent_name,
+                    'weight', lookthrough_portfolio_weight
+               ) ORDER BY lookthrough_portfolio_weight DESC) AS contributors
+        FROM portfolio_industry_allocations
+        WHERE batch_id = %s
+        GROUP BY industry_name
+        ORDER BY weight DESC NULLS LAST
+        LIMIT 12
+        """,
+        (batch_id,),
+    )
+    if not industry_rows:
+        industry_rows = rows(
+            """
+            SELECT COALESCE(NULLIF(related_sector, ''), security_type, 'unknown') AS industry_name,
+                   SUM(COALESCE(portfolio_weight, 0)) AS weight,
+                   jsonb_agg(jsonb_build_object(
+                        'parent_code', security_code,
+                        'parent_name', security_name,
+                        'weight', portfolio_weight
+                   ) ORDER BY portfolio_weight DESC) AS contributors
+            FROM portfolio_positions
+            WHERE batch_id = %s
+            GROUP BY COALESCE(NULLIF(related_sector, ''), security_type, 'unknown')
+            ORDER BY weight DESC
+            LIMIT 12
+            """,
+            (batch_id,),
+        )
+    return {"batch": batch, "underlying": under, "overlaps": overlaps, "industries": industry_rows}
+
+
+def recent_transactions(batch_id: str) -> list[dict[str, Any]]:
+    return rows(
+        """
+        SELECT trade_date, trade_time, security_code, security_name, transaction_type,
+               quantity, price, cash_flow_amount, fee
+        FROM portfolio_transactions
+        WHERE batch_id = %s
+        ORDER BY trade_date DESC, trade_time DESC NULLS LAST
+        LIMIT 30
+        """,
+        (batch_id,),
+    )
+
+
+def compare_batches(from_batch: str, to_batch: str) -> dict[str, Any]:
+    old = one("SELECT * FROM portfolio_import_batches WHERE batch_id = %s", (from_batch,))
+    new = one("SELECT * FROM portfolio_import_batches WHERE batch_id = %s", (to_batch,))
+    if not old or not new:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    old_metrics = batch_metrics(from_batch)
+    new_metrics = batch_metrics(to_batch)
+    joined = rows(
+        """
+        SELECT COALESCE(n.security_code, o.security_code) AS security_code,
+               COALESCE(n.security_name, o.security_name) AS security_name,
+               COALESCE(n.holding_amount, 0)::double precision AS new_amount,
+               COALESCE(o.holding_amount, 0)::double precision AS old_amount,
+               COALESCE(n.portfolio_weight, 0) AS new_weight,
+               COALESCE(o.portfolio_weight, 0) AS old_weight,
+               COALESCE(n.holding_pnl, 0)::double precision AS new_pnl,
+               COALESCE(o.holding_pnl, 0)::double precision AS old_pnl
+        FROM (
+            SELECT * FROM portfolio_positions WHERE batch_id = %s
+        ) n
+        FULL OUTER JOIN (
+            SELECT * FROM portfolio_positions WHERE batch_id = %s
+        ) o ON n.security_code = o.security_code
+        ORDER BY ABS(COALESCE(n.portfolio_weight, 0) - COALESCE(o.portfolio_weight, 0)) DESC
+        LIMIT 30
+        """,
+        (to_batch, from_batch),
+    )
+    return {
+        "from": old,
+        "to": new,
+        "summary": {
+            "total_assets_change": (new.get("total_assets") or 0) - (old.get("total_assets") or 0),
+            "position_count_change": (new.get("position_count") or 0) - (old.get("position_count") or 0),
+            "top5_weight_change": (new_metrics.get("top5_position_weight") or 0) - (old_metrics.get("top5_position_weight") or 0),
+        },
+        "positions": joined,
+    }
+
+
+def upsert_batch(conn, batch: dict[str, Any]) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO portfolio_import_batches
+                (batch_id, source_file, source_file_mtime, as_of_date, uploaded_at,
+                 original_filename, file_sha256, status, message, is_archived,
+                 total_assets, position_count, meta_json, report_markdown)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, false, %s, %s, %s, %s)
+            ON CONFLICT (batch_id) DO UPDATE SET
+                source_file = EXCLUDED.source_file,
+                source_file_mtime = EXCLUDED.source_file_mtime,
+                as_of_date = EXCLUDED.as_of_date,
+                uploaded_at = EXCLUDED.uploaded_at,
+                original_filename = EXCLUDED.original_filename,
+                file_sha256 = EXCLUDED.file_sha256,
+                status = EXCLUDED.status,
+                message = EXCLUDED.message,
+                total_assets = EXCLUDED.total_assets,
+                position_count = EXCLUDED.position_count,
+                meta_json = EXCLUDED.meta_json,
+                report_markdown = EXCLUDED.report_markdown
+            """,
+            (
+                batch["batch_id"],
+                batch["stored_path"],
+                batch.get("source_file_mtime"),
+                batch["as_of_date"],
+                batch["uploaded_at"],
+                batch["original_filename"],
+                batch["file_sha256"],
+                batch["status"],
+                batch["message"],
+                batch.get("total_assets"),
+                batch.get("position_count", 0),
+                Json(batch.get("meta_json") or {}),
+                batch.get("report_markdown") or "",
+            ),
+        )
+
+
+def build_report(batch: dict[str, Any], prev: dict[str, Any] | None) -> str:
+    batch_id = batch["batch_id"]
+    positions = batch_positions(batch_id, 12)
+    metrics = batch_metrics(batch_id)
+    alloc = asset_allocation(batch_id)
+    industries = industry_allocation(batch_id)
+    gain = sorted(positions, key=lambda item: float(item.get("holding_pnl") or 0), reverse=True)[:5]
+    loss = sorted(positions, key=lambda item: float(item.get("holding_pnl") or 0))[:5]
+    lines = [
+        f"# 持仓分析报告 - {fmt_date(batch.get('as_of_date'))}",
+        "",
+        f"上传批次：`{batch_id}`",
+        f"上传时间：{fmt_dt(batch.get('uploaded_at'))}",
+        f"原始文件：{batch.get('original_filename') or '-'}",
+        "",
+        "## 核心结论",
+        f"- 总资产：{money(batch.get('total_assets'))}",
+        f"- 持仓数量：{batch.get('position_count') or 0}",
+        f"- Top 3 集中度：{pct(metrics.get('top3_position_weight'))}",
+        f"- Top 5 集中度：{pct(metrics.get('top5_position_weight'))}",
+        f"- 估算现金权重：{pct(metrics.get('cash_weight_estimated'))}",
+        f"- 股性资产权重：{pct(metrics.get('equity_like_weight'))}；债性资产权重：{pct(metrics.get('bond_like_weight'))}；QDII 权重：{pct(metrics.get('qdii_weight'))}",
+    ]
+    if prev:
+        comp = compare_batches(prev["batch_id"], batch_id)["summary"]
+        lines += [
+            "",
+            "## 较上一批变化",
+            f"- 总资产变化：{money(comp['total_assets_change'])}",
+            f"- 持仓数量变化：{comp['position_count_change']:+d}",
+            f"- Top 5 集中度变化：{pct(comp['top5_weight_change'], signed=True)}",
+        ]
+    lines += ["", "## 资产分布"]
+    lines += [f"- {item['allocation_bucket']}：{money(item.get('amount'))}，{pct(item.get('weight'))}" for item in alloc[:8]] or ["- 暂无资产分布数据"]
+    lines += ["", "## 行业/主题暴露"]
+    lines += [f"- {item['industry_name']}：{pct(item.get('weight'))}" for item in industries[:8]] or ["- 暂无行业/主题数据"]
+    lines += ["", "## 贡献靠前"]
+    lines += [f"- {item['security_code']} {item['security_name']}：持有盈亏 {money(item.get('holding_pnl'))}，仓位 {pct(item.get('portfolio_weight'))}" for item in gain] or ["- 暂无"]
+    lines += ["", "## 拖累靠前"]
+    lines += [f"- {item['security_code']} {item['security_name']}：持有盈亏 {money(item.get('holding_pnl'))}，仓位 {pct(item.get('portfolio_weight'))}" for item in loss] or ["- 暂无"]
+    lines += ["", "## 操作提示", "- 优先检查单一产品和 Top 5 集中度是否符合自己的风险预算。", "- 无法穿透的基金/ETF 会先按产品本身作为代理暴露。", "- 本报告只用于个人研究辅助，不构成投资建议。"]
+    return "\n".join(lines) + "\n"
+
+
+def mark_failed(batch: dict[str, Any], message: str) -> None:
+    with db_conn() as conn:
+        upsert_batch(conn, batch | {"status": "failed", "message": message[:900], "total_assets": None, "position_count": 0})
+        conn.commit()
+
+
+def process_upload(stored_path: Path, original_filename: str, uploaded_at: datetime, digest: str, as_of_override: date | None, batch_id_override: str | None = None) -> dict[str, Any]:
+    batch_id = batch_id_override or make_batch_id(uploaded_at, digest)
+    inferred_date = as_of_override or portfolio.infer_as_of_date(stored_path, original_filename) or uploaded_at.date()
+    existing_batch = one("SELECT meta_json FROM portfolio_import_batches WHERE batch_id = %s", (batch_id,)) if batch_id_override else None
+    base = {
+        "batch_id": batch_id,
+        "uploaded_at": uploaded_at,
+        "original_filename": original_filename,
+        "stored_path": str(stored_path),
+        "file_sha256": digest,
+        "source_file_mtime": datetime.fromtimestamp(stored_path.stat().st_mtime, tz=timezone.utc),
+        "as_of_date": inferred_date,
+        "status": "failed",
+        "message": "import started",
+        "meta_json": existing_batch.get("meta_json") if existing_batch else {},
+        "total_assets": None,
+        "position_count": 0,
+        "report_markdown": "",
+    }
     try:
-        return ask_model(question)
-    except Exception as exc:  # noqa: BLE001
-        save_qa(question, f"AI 调用失败：{exc}", os.getenv("OPENAI_MODEL"), False, {}, str(exc))
-        return {"ok": False, "answer": f"AI 调用失败：{exc}", "model": os.getenv("OPENAI_MODEL")}
+        workbook = portfolio.read_portfolio_workbook(stored_path, base["as_of_date"])
+        if not workbook.positions:
+            raise ValueError("No positions found in 持仓数据 sheet.")
+        with db_conn() as conn:
+            ensure_schema(conn)
+            upsert_batch(conn, base | {"status": "failed", "message": "importing"})
+            catalog = portfolio.fund_catalog() if AKSHARE_ENABLED else set()
+            positions = enrich_positions(workbook.positions, catalog)
+            clear_batch(conn, batch_id)
+            insert_positions(conn, batch_id, base["as_of_date"], positions)
+            insert_closed_positions(conn, batch_id, workbook.closed_positions)
+            insert_transactions(conn, batch_id, workbook.transactions)
+            metadata, under, industries, errors = collect_market_data(conn, batch_id, base["as_of_date"], positions, not AKSHARE_ENABLED)
+            insert_fund_metadata(conn, batch_id, base["as_of_date"], metadata)
+            insert_underlying(conn, batch_id, base["as_of_date"], under)
+            insert_industries(conn, batch_id, base["as_of_date"], industries)
+            insert_allocations(conn, batch_id, base["as_of_date"], portfolio.compute_portfolio_allocations(positions))
+            insert_risk_metrics(conn, batch_id, base["as_of_date"], portfolio.compute_risk_metrics(positions, under, metadata))
+            total_assets = sum((portfolio.to_decimal(row.get("持有金额")) or Decimal("0") for row in positions), Decimal("0"))
+            status = "partial" if errors else "complete"
+            message = "; ".join(errors[:3]) if errors else "OK"
+            base.update({
+                "status": status,
+                "message": message[:900],
+                "total_assets": total_assets,
+                "position_count": len(positions),
+                "meta_json": (base.get("meta_json") or {}) | {"summary": workbook.summary, "position_rows": len(workbook.positions), "closed_rows": len(workbook.closed_positions), "transaction_rows": len(workbook.transactions), "akshare_enabled": AKSHARE_ENABLED, "errors": errors},
+            })
+            upsert_batch(conn, base)
+            conn.commit()
+        report = build_report(base, previous_success(batch_id))
+        execute("UPDATE portfolio_import_batches SET report_markdown = %s WHERE batch_id = %s", (report, batch_id))
+        base["report_markdown"] = report
+        return base
+    except Exception as exc:
+        mark_failed(base, str(exc))
+        return base | {"status": "failed", "message": str(exc)}
+
+
+def base_layout(title: str, body: str, user: str | None = None) -> str:
+    nav = "" if not user else "<nav><a href='/'>总览</a><a href='/timeline'>整体分析</a><a href='/uploads'>上传记录</a><a href='/api/logout'>退出</a></nav>"
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)} · {APP_TITLE}</title><style>{CSS}</style></head><body><header class="topbar"><a class="brand" href="/">{APP_TITLE}</a>{nav}</header><main>{body}</main></body></html>"""
+
+
+def upload_form() -> str:
+    return """<form class="upload" action="/api/upload" method="post" enctype="multipart/form-data"><label>上传持仓 Excel<input type="file" name="files" accept=".xlsx" multiple required></label><label>日期覆盖（可选）<input type="date" name="as_of_date"></label><button type="submit">上传并分析</button><p class="form-hint">可一次选择多个 .xlsx；不填日期时系统会先从文件内容识别，再从文件名识别。</p></form>"""
+
+
+def metric_cards(batch: dict[str, Any] | None, metrics: dict[str, Any]) -> str:
+    items = [("总资产", money(batch.get("total_assets") if batch else None)), ("持仓数", str(batch.get("position_count") or 0) if batch else "0"), ("Top 3", pct(metrics.get("top3_position_weight"))), ("Top 5", pct(metrics.get("top5_position_weight"))), ("股性", pct(metrics.get("equity_like_weight"))), ("债性", pct(metrics.get("bond_like_weight")))]
+    return "<section class='metrics'>" + "".join(f"<article><span>{esc(k)}</span><strong>{esc(v)}</strong></article>" for k, v in items) + "</section>"
+
+
+def bar_chart(items: list[dict[str, Any]], label_key: str, value_key: str, money_values: bool = False, limit: int = 12) -> str:
+    if not items:
+        return "<p class='muted'>暂无数据</p>"
+    max_value = max([abs(float(item.get(value_key) or 0)) for item in items[:limit]] or [1]) or 1
+    out = []
+    for item in items[:limit]:
+        value = float(item.get(value_key) or 0)
+        width = max(2, abs(value) / max_value * 100)
+        text = money(value) if money_values else pct(value)
+        out.append(f"<div class='bar-row'><span>{esc(item.get(label_key))}</span><div><i style='width:{width:.2f}%'></i></div><b>{esc(text)}</b></div>")
+    return "<div class='bars'>" + "".join(out) + "</div>"
+
+
+
+
+def as_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def date_label(value: Any) -> str:
+    return fmt_date(value)[5:] if value else "-"
+
+
+def metric_series(items: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    return [{"x": item["as_of_date"], "y": item.get(key), "batch_id": item["batch_id"], "label": item.get("original_filename")} for item in items]
+
+
+def allocation_history(batch_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    if not batch_ids:
+        return {}
+    data = rows(
+        """
+        SELECT batch_id, allocation_bucket, amount, weight
+        FROM portfolio_asset_allocation
+        WHERE batch_id = ANY(%s)
+        """,
+        (batch_ids,),
+    )
+    by_batch = {batch_id: {} for batch_id in batch_ids}
+    for item in data:
+        by_batch.setdefault(item["batch_id"], {})[item["allocation_bucket"]] = item
+    buckets = sorted({item["allocation_bucket"] for item in data})
+    return {
+        bucket: [{"batch_id": batch_id, "weight": (by_batch.get(batch_id, {}).get(bucket, {}).get("weight") or 0)} for batch_id in batch_ids]
+        for bucket in buckets
+    }
+
+
+def analytics_timeline(months: int = 6) -> dict[str, Any]:
+    items = success_batches(500, months=months)
+    if not items:
+        return {"points": [], "series": {}, "allocation_history": {}, "risk": {}, "top_changes": [], "xray": None}
+    out: list[dict[str, Any]] = []
+    running_peak: float | None = None
+    max_drawdown = 0.0
+    consecutive_loss_days = 0
+    trailing_loss_streak = 0
+    previous: dict[str, Any] | None = None
+    for batch in items:
+        metrics = batch_metrics(batch["batch_id"])
+        pnl = one(
+            """
+            SELECT COALESCE(SUM(today_pnl), 0) AS today_pnl,
+                   COALESCE(SUM(holding_pnl), 0) AS holding_pnl,
+                   COALESCE(SUM(cumulative_pnl), 0) AS cumulative_pnl,
+                   MAX(portfolio_weight) AS max_position_weight
+            FROM portfolio_positions
+            WHERE batch_id = %s
+            """,
+            (batch["batch_id"],),
+        ) or {}
+        industry = industry_allocation(batch["batch_id"])
+        total_assets = as_float(batch.get("total_assets"))
+        running_peak = total_assets if running_peak is None else max(running_peak, total_assets)
+        drawdown = (total_assets / running_peak - 1) if running_peak else 0
+        max_drawdown = min(max_drawdown, drawdown)
+        if as_float(pnl.get("today_pnl")) < 0:
+            consecutive_loss_days += 1
+        else:
+            consecutive_loss_days = 0
+        trailing_loss_streak = consecutive_loss_days
+        out.append({
+            **batch,
+            "today_pnl": pnl.get("today_pnl"),
+            "holding_pnl": pnl.get("holding_pnl"),
+            "cumulative_pnl": pnl.get("cumulative_pnl"),
+            "total_assets_change": None if previous is None else total_assets - as_float(previous.get("total_assets")),
+            "position_count_change": None if previous is None else (batch.get("position_count") or 0) - (previous.get("position_count") or 0),
+            "top3_weight": metrics.get("top3_position_weight"),
+            "top5_weight": metrics.get("top5_position_weight"),
+            "top10_weight": metrics.get("top10_underlying_weight"),
+            "equity_like_weight": metrics.get("equity_like_weight"),
+            "bond_like_weight": metrics.get("bond_like_weight"),
+            "qdii_weight": metrics.get("qdii_weight"),
+            "cash_weight": metrics.get("cash_weight_estimated"),
+            "max_position_weight": pnl.get("max_position_weight"),
+            "max_industry_name": industry[0]["industry_name"] if industry else None,
+            "max_industry_weight": industry[0]["weight"] if industry else None,
+            "drawdown": drawdown,
+            "previous_batch_id": previous.get("batch_id") if previous else None,
+        })
+        previous = batch
+    latest = out[-1]
+    prev = out[-2] if len(out) > 1 else None
+    top_changes = compare_batches(prev["batch_id"], latest["batch_id"])["positions"] if prev else []
+    return {
+        "points": out,
+        "series": {
+            "assets": metric_series(out, "total_assets"),
+            "today_pnl": metric_series(out, "today_pnl"),
+            "holding_pnl": metric_series(out, "holding_pnl"),
+            "cumulative_pnl": metric_series(out, "cumulative_pnl"),
+            "top3_weight": metric_series(out, "top3_weight"),
+            "top5_weight": metric_series(out, "top5_weight"),
+            "top10_weight": metric_series(out, "top10_weight"),
+            "equity_like_weight": metric_series(out, "equity_like_weight"),
+            "bond_like_weight": metric_series(out, "bond_like_weight"),
+            "qdii_weight": metric_series(out, "qdii_weight"),
+            "cash_weight": metric_series(out, "cash_weight"),
+            "drawdown": metric_series(out, "drawdown"),
+        },
+        "allocation_history": allocation_history([item["batch_id"] for item in out]),
+        "risk": {
+            "latest_batch_id": latest["batch_id"],
+            "latest_as_of_date": latest["as_of_date"],
+            "max_position_weight": latest.get("max_position_weight"),
+            "top5_weight": latest.get("top5_weight"),
+            "max_industry_name": latest.get("max_industry_name"),
+            "max_industry_weight": latest.get("max_industry_weight"),
+            "max_drawdown_estimated": max_drawdown,
+            "trailing_loss_streak": trailing_loss_streak,
+            "equity_like_weight": latest.get("equity_like_weight"),
+            "bond_like_weight": latest.get("bond_like_weight"),
+            "qdii_weight": latest.get("qdii_weight"),
+            "cash_weight": latest.get("cash_weight"),
+        },
+        "top_changes": top_changes,
+        "xray": xray_data(latest["batch_id"]),
+    }
+
+
+def svg_line_chart(series_items: list[tuple[str, list[dict[str, Any]], str]], money_values: bool = False, pct_values: bool = False, height: int = 260) -> str:
+    points = [(idx, as_float(point.get("y")), point) for _, series, _ in series_items for idx, point in enumerate(series) if point.get("y") is not None]
+    if not points:
+        return "<p class='muted'>暂无数据</p>"
+    width, pad = 760, 34
+    min_y = min(value for _, value, _ in points)
+    max_y = max(value for _, value, _ in points)
+    if min_y == max_y:
+        min_y -= 1
+        max_y += 1
+    max_idx = max((len(series) for _, series, _ in series_items), default=1) - 1 or 1
+
+    def xy(idx: int, value: float) -> tuple[float, float]:
+        x = pad + idx / max_idx * (width - pad * 2)
+        y = height - pad - (value - min_y) / (max_y - min_y) * (height - pad * 2)
+        return x, y
+
+    paths = []
+    dots = []
+    labels = series_items[0][1]
+    for name, series, color in series_items:
+        coords = [xy(idx, as_float(point.get("y"))) for idx, point in enumerate(series) if point.get("y") is not None]
+        if not coords:
+            continue
+        path = " ".join(("M" if idx == 0 else "L") + f"{x:.1f},{y:.1f}" for idx, (x, y) in enumerate(coords))
+        paths.append(f"<path d='{path}' fill='none' stroke='{color}' stroke-width='2.4' stroke-linecap='round'/>")
+        for idx, point in enumerate(series):
+            if point.get("y") is None:
+                continue
+            x, y = xy(idx, as_float(point.get("y")))
+            raw = point.get("y")
+            text = money(raw) if money_values else pct(raw) if pct_values else f"{as_float(raw):.2f}"
+            dots.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='3.2' fill='{color}'><title>{esc(name)} · {fmt_date(point.get('x'))}: {esc(text)}</title></circle>")
+    axis_labels = "".join(
+        f"<text x='{xy(idx, min_y)[0]:.1f}' y='{height-8}' text-anchor='middle'>{esc(date_label(point.get('x')))}</text>"
+        for idx, point in enumerate(labels)
+    )
+    legend = "".join(f"<span><i style='background:{color}'></i>{esc(name)}</span>" for name, _, color in series_items)
+    y_top = money(max_y) if money_values else pct(max_y) if pct_values else f"{max_y:.2f}"
+    y_bottom = money(min_y) if money_values else pct(min_y) if pct_values else f"{min_y:.2f}"
+    return f"<div class='chart-legend'>{legend}</div><svg class='chart' viewBox='0 0 {width} {height}' role='img'><line x1='{pad}' y1='{pad}' x2='{pad}' y2='{height-pad}'/><line x1='{pad}' y1='{height-pad}' x2='{width-pad}' y2='{height-pad}'/><text x='4' y='{pad+4}'>{esc(y_top)}</text><text x='4' y='{height-pad}'>{esc(y_bottom)}</text>{''.join(paths)}{''.join(dots)}{axis_labels}</svg>"
+
+
+def svg_stacked_allocation(data: dict[str, list[dict[str, Any]]], labels: list[dict[str, Any]], height: int = 260) -> str:
+    if not data or not labels:
+        return "<p class='muted'>暂无数据</p>"
+    colors = ["#0f766e", "#2563eb", "#d97706", "#7c3aed", "#475569", "#be123c", "#15803d"]
+    width, pad = 760, 30
+    max_idx = max(len(labels) - 1, 1)
+    buckets = list(data.keys())[:7]
+    cumulative = [0.0 for _ in labels]
+    areas = []
+    for bucket_index, bucket in enumerate(buckets):
+        upper = []
+        lower = []
+        values = data[bucket]
+        for idx, point in enumerate(values[:len(labels)]):
+            lower_value = cumulative[idx]
+            upper_value = min(1.0, lower_value + as_float(point.get("weight")))
+            cumulative[idx] = upper_value
+            x = pad + idx / max_idx * (width - pad * 2)
+            y_upper = height - pad - upper_value * (height - pad * 2)
+            y_lower = height - pad - lower_value * (height - pad * 2)
+            upper.append((x, y_upper))
+            lower.append((x, y_lower))
+        path = " ".join(("M" if i == 0 else "L") + f"{x:.1f},{y:.1f}" for i, (x, y) in enumerate(upper))
+        path += " " + " ".join(f"L{x:.1f},{y:.1f}" for x, y in reversed(lower)) + " Z"
+        areas.append(f"<path d='{path}' fill='{colors[bucket_index % len(colors)]}' opacity='.78'><title>{esc(bucket)}</title></path>")
+    axis_labels = "".join(
+        f"<text x='{pad + idx / max_idx * (width - pad * 2):.1f}' y='{height-8}' text-anchor='middle'>{esc(date_label(point.get('as_of_date')))}</text>"
+        for idx, point in enumerate(labels)
+    )
+    legend = "".join(f"<span><i style='background:{colors[idx % len(colors)]}'></i>{esc(bucket)}</span>" for idx, bucket in enumerate(buckets))
+    return f"<div class='chart-legend'>{legend}</div><svg class='chart' viewBox='0 0 {width} {height}' role='img'><line x1='{pad}' y1='{pad}' x2='{pad}' y2='{height-pad}'/><line x1='{pad}' y1='{height-pad}' x2='{width-pad}' y2='{height-pad}'/>{''.join(areas)}{axis_labels}</svg>"
+
+
+def top_changes_table(changes: list[dict[str, Any]]) -> str:
+    if not changes:
+        return "<p class='muted'>暂无相邻批次变化</p>"
+    rows_html = []
+    for item in changes[:20]:
+        old_amount = as_float(item.get("old_amount"))
+        new_amount = as_float(item.get("new_amount"))
+        if old_amount == 0 and new_amount != 0:
+            action = "新增"
+        elif old_amount != 0 and new_amount == 0:
+            action = "清仓"
+        elif new_amount > old_amount:
+            action = "加仓"
+        elif new_amount < old_amount:
+            action = "减仓"
+        else:
+            action = "持平"
+        rows_html.append(
+            f"<tr><td>{esc(action)}</td><td>{esc(item.get('security_code'))}</td><td>{esc(item.get('security_name'))}</td><td>{money(old_amount)}</td><td>{money(new_amount)}</td><td>{money(new_amount - old_amount, signed=True)}</td><td>{pct(as_float(item.get('new_weight')) - as_float(item.get('old_weight')), signed=True)}</td><td>{money(as_float(item.get('new_pnl')) - as_float(item.get('old_pnl')), signed=True)}</td></tr>"
+        )
+    return f"<table><thead><tr><th>动作</th><th>代码</th><th>名称</th><th>旧金额</th><th>新金额</th><th>金额变化</th><th>仓位变化</th><th>盈亏变化</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
+
+
+def xray_panel(data: dict[str, Any]) -> str:
+    under_rows = "".join(
+        f"<tr><td>{esc(i.get('underlying_code'))}</td><td>{esc(i.get('underlying_name'))}</td><td>{esc(i.get('underlying_type'))}</td><td>{money(i.get('amount'))}</td><td>{pct(i.get('weight'))}</td><td>{esc(i.get('source_count'))}</td></tr>"
+        for i in data.get("underlying", [])[:20]
+    )
+    overlap_rows = "".join(
+        f"<tr><td>{esc(i.get('underlying_code'))}</td><td>{esc(i.get('underlying_name'))}</td><td>{pct(i.get('weight'))}</td><td>{esc(i.get('source_count'))}</td></tr>"
+        for i in data.get("overlaps", [])[:12]
+    ) or "<tr><td colspan='4' class='muted'>暂无重叠穿透持仓</td></tr>"
+    industry_rows = []
+    for item in data.get("industries", [])[:10]:
+        contributors = item.get("contributors") or []
+        detail = ", ".join(f"{c.get('parent_name')} {pct(c.get('weight'))}" for c in contributors[:4])
+        industry_rows.append(f"<tr><td>{esc(item.get('industry_name'))}</td><td>{pct(item.get('weight'))}</td><td>{esc(detail)}</td></tr>")
+    return f"<section class='grid two'><article class='panel'><h2>穿透重仓 Top 20</h2><table><thead><tr><th>代码</th><th>名称</th><th>类型</th><th>金额</th><th>权重</th><th>来源数</th></tr></thead><tbody>{under_rows}</tbody></table></article><article class='panel'><h2>重叠持仓</h2><table><thead><tr><th>代码</th><th>名称</th><th>合计权重</th><th>来源数</th></tr></thead><tbody>{overlap_rows}</tbody></table></article></section><section class='panel'><h2>行业/主题贡献来源</h2><table><thead><tr><th>行业/主题</th><th>权重</th><th>主要来源</th></tr></thead><tbody>{''.join(industry_rows)}</tbody></table></section>"
+
+def positions_table(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "<p class='muted'>暂无持仓</p>"
+    body = "".join(f"<tr><td>{esc(i['security_code'])}</td><td>{esc(i['security_name'])}</td><td>{esc(i.get('security_type'))}</td><td>{money(i.get('holding_amount'))}</td><td>{pct(i.get('portfolio_weight'))}</td><td>{money(i.get('holding_pnl'))}</td><td>{pct(i.get('return_1m'), signed=True)}</td><td>{pct(i.get('return_1y'), signed=True)}</td></tr>" for i in items)
+    return f"<div class='table-wrap'><table><thead><tr><th>代码</th><th>名称</th><th>类型</th><th>金额</th><th>仓位</th><th>持有盈亏</th><th>近1月</th><th>近1年</th></tr></thead><tbody>{body}</tbody></table></div>"
+
+
+def upload_result_page(results: list[dict[str, Any]], skipped: list[dict[str, Any]], user: str | None) -> HTMLResponse:
+    accepted_rows = "".join(
+        f"<tr><td><a href='{batch_link(item['batch_id'])}'>{esc(item['original_filename'])}</a></td><td>{fmt_date(item.get('as_of_date'))}</td><td>{esc(item.get('status'))}</td><td>{money(item.get('total_assets'))}</td><td>{esc(item.get('position_count'))}</td><td>{esc(item.get('message'))}</td></tr>"
+        for item in results
+    ) or "<tr><td colspan='6' class='muted'>没有新文件被接收</td></tr>"
+    skipped_rows = "".join(
+        f"<tr><td>{esc(item['filename'])}</td><td>{fmt_date(item.get('as_of_date'))}</td><td><a href='{batch_link(item['duplicate_of'])}'>{esc(item['duplicate_of'])}</a></td><td>{esc(item.get('reason'))}</td></tr>"
+        for item in skipped
+    ) or "<tr><td colspan='4' class='muted'>没有重复文件</td></tr>"
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Upload result</p><h1>上传结果</h1><p class='subtitle'>新接收 {len(results)} 个文件，拒收重复 {len(skipped)} 个文件。</p></div></section><div class='actions'><a href='/timeline'>查看整体分析</a><a href='/uploads'>查看上传记录</a></div><section class='panel'><h2>已接收</h2><table><thead><tr><th>文件</th><th>持仓日期</th><th>状态</th><th>总资产</th><th>行数</th><th>消息</th></tr></thead><tbody>{accepted_rows}</tbody></table></section><section class='panel'><h2>重复拒收</h2><table><thead><tr><th>文件</th><th>持仓日期</th><th>已存在批次</th><th>原因</th></tr></thead><tbody>{skipped_rows}</tbody></table></section>"
+    return HTMLResponse(base_layout("上传结果", body, user))
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    if session_user(request):
+        return RedirectResponse("/", status_code=303)
+    body = "<section class='login'><h1>登录</h1><form method='post' action='/api/login'><label>用户名<input name='username' autocomplete='username'></label><label>密码<input name='password' type='password' autocomplete='current-password'></label><button type='submit'>进入</button></form></section>"
+    return HTMLResponse(base_layout("登录", body))
+
+
+@app.post("/api/login")
+async def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    ip = client_ip(request)
+    locked = current_login_lock(username, ip)
+    if locked:
+        body = "<section class='login'><h1>暂时锁定</h1><p>登录错误次数过多，请稍后再试。</p><a href='/login'>返回</a></section>"
+        return HTMLResponse(base_layout("暂时锁定", body), status_code=429)
+
+    if not ADMIN_PASSWORD or username != ADMIN_USERNAME or not hmac.compare_digest(password, ADMIN_PASSWORD):
+        failure = record_login_failure(username, ip)
+        if failure.get("locked_until"):
+            body = "<section class='login'><h1>暂时锁定</h1><p>登录错误次数过多，系统已暂停该来源继续尝试。</p><a href='/login'>返回</a></section>"
+            return HTMLResponse(base_layout("暂时锁定", body), status_code=429)
+        body = "<section class='login'><h1>登录失败</h1><p>用户名或密码错误。</p><a href='/login'>返回</a></section>"
+        return HTMLResponse(base_layout("登录失败", body), status_code=401)
+
+    clear_login_failures(username, ip)
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(COOKIE_NAME, make_session(username), httponly=True, secure=True, samesite="lax", max_age=60 * 60 * 24 * 30)
+    return response
+
+
+@app.get("/api/logout")
+def logout():
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(COOKIE_NAME)
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    data = market_summary()
-    data["asset_counts"] = serialize(data["asset_counts"])
-    generated_at = datetime.now(timezone.utc)
-    return render_page(data, generated_at)
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    user = session_user(request)
+    batch = latest_batch()
+    if not batch:
+        body = f"<section class='hero'><div><p class='eyebrow'>Portfolio cockpit</p><h1>持仓分析</h1><p class='subtitle'>上传每日或每周多个持仓文件，每个文件都会形成独立批次和报告。</p></div></section>{upload_form()}<section class='panel'><h2>还没有成功导入的持仓</h2><p class='muted'>上传 .xlsx 后，这里会显示最新报告。</p></section>"
+        return HTMLResponse(base_layout("总览", body, user))
+    metrics = batch_metrics(batch["batch_id"])
+    positions = batch_positions(batch["batch_id"], 20)
+    alloc = asset_allocation(batch["batch_id"])
+    industries = industry_allocation(batch["batch_id"])
+    pnl_items = sorted(positions, key=lambda item: abs(float(item.get("holding_pnl") or 0)), reverse=True)
+    body = f"<section class='hero'><div><p class='eyebrow'>Latest portfolio</p><h1>持仓分析</h1><p class='subtitle'>最新成功批次：{esc(batch['batch_id'])}</p></div><div class='hero-meta'><span>上传</span><strong>{fmt_dt(batch.get('uploaded_at'))}</strong><span>文件</span><strong>{esc(batch.get('original_filename'))}</strong></div></section>{upload_form()}{metric_cards(batch, metrics)}<section class='grid two'><article class='panel'><h2>资产类型</h2>{bar_chart(alloc, 'allocation_bucket', 'weight')}</article><article class='panel'><h2>行业/主题</h2>{bar_chart(industries, 'industry_name', 'weight')}</article></section><section class='grid two'><article class='panel'><h2>持仓权重</h2>{bar_chart(positions, 'security_name', 'portfolio_weight')}</article><article class='panel'><h2>盈亏贡献</h2>{bar_chart(pnl_items, 'security_name', 'holding_pnl', True)}</article></section><section class='panel'><div class='section-head'><h2>最新报告</h2><a href='{batch_link(batch['batch_id'])}'>打开完整报告</a></div><pre class='report-text'>{esc((batch.get('report_markdown') or '')[:2200])}</pre></section><section class='panel'><h2>主要持仓</h2>{positions_table(positions)}</section>"
+    return HTMLResponse(base_layout("总览", body, user))
 
 
-def render_page(data, generated_at):
-    failed = [item for item in data["status"] if not item["ok"]]
-    report = data.get("latest_report")
-    if report:
-        report_html = f"""
-        <section class="report {pill_class(report['status'])}">
-          <div class="report-main">
-            <div class="report-head">
-              <span class="pill {pill_class(report['status'])}">{report['status']}</span>
-              <span>{report.get('model') or 'No model configured'}</span>
-              <span>Generated {fmt_dt(report.get('generated_at'))}</span>
-              <span>Data as of {fmt_dt(report.get('data_as_of'))}</span>
-            </div>
-            <h2>{esc(report['title'])}</h2>
-            <p>{esc(report['summary'])}</p>
-            <div class="report-metrics">
-              <div><span>Stance</span><strong>{esc(report.get('stance') or '-')}</strong></div>
-              <div><span>Confidence</span><strong>{fmt_num((report.get('confidence') or 0) * 100, 0)}%</strong></div>
-            </div>
-          </div>
-          <div class="report-lists">
-            <section>
-              <h3>Recommendations</h3>
-              <ul>{list_items(report.get('recommendations'))}</ul>
-            </section>
-            <section>
-              <h3>Risks</h3>
-              <ul>{list_items(report.get('risks'))}</ul>
-            </section>
-            <section>
-              <h3>Watchlist</h3>
-              <ul>{list_items(report.get('watchlist'))}</ul>
-            </section>
-          </div>
-        </section>
-        """
-    else:
-        report_html = """
-        <section class="report warn">
-          <div class="report-main">
-            <div class="report-head"><span class="pill warn">missing</span></div>
-            <h2>还没有 Agent 报告</h2>
-            <p>运行 generate_agent_report.py 后，这里会显示最新研究摘要。</p>
-          </div>
-        </section>
-        """
-    status_cards = "\n".join(
+def upload_filters(request: Request) -> dict[str, Any]:
+    latest = one("SELECT to_char(MAX(as_of_date), 'YYYY-MM') AS month FROM portfolio_import_batches")
+    month = request.query_params.get("month") or (latest or {}).get("month") or now_utc().strftime("%Y-%m")
+    page = max(1, int(request.query_params.get("page") or "1"))
+    return {
+        "month": month,
+        "status": request.query_params.get("status") or "",
+        "q": request.query_params.get("q") or "",
+        "start": request.query_params.get("start") or "",
+        "end": request.query_params.get("end") or "",
+        "page": page,
+        "per_page": 30,
+    }
+
+
+def upload_query(filters: dict[str, Any]) -> dict[str, Any]:
+    where = ["true"]
+    params: list[Any] = []
+    if filters.get("month"):
+        where.append("to_char(as_of_date, 'YYYY-MM') = %s")
+        params.append(filters["month"])
+    if filters.get("status"):
+        where.append("status = %s")
+        params.append(filters["status"])
+    if filters.get("q"):
+        where.append("(original_filename ILIKE %s OR batch_id ILIKE %s)")
+        params.extend([f"%{filters['q']}%", f"%{filters['q']}%"])
+    if filters.get("start"):
+        where.append("as_of_date >= %s")
+        params.append(filters["start"])
+    if filters.get("end"):
+        where.append("as_of_date <= %s")
+        params.append(filters["end"])
+    where_sql = " AND ".join(where)
+    total = one(f"SELECT COUNT(*) AS count FROM portfolio_import_batches WHERE {where_sql}", tuple(params))["count"]
+    offset = (filters["page"] - 1) * filters["per_page"]
+    data = rows(
         f"""
-        <article class="status-card {status_card_class(item)}">
-          <div class="status-top">
-            <span>{item['source']}</span>
-            <strong>{status_text(item)}</strong>
-          </div>
-          <p>{item.get('message') or ''}</p>
-          <dl>
-            <div><dt>Observation</dt><dd>{fmt_dt(item.get('latest_observation_ts'))}</dd></div>
-            <div><dt>Synced</dt><dd>{fmt_dt(item.get('last_run'))}</dd></div>
-            <div><dt>Lag</dt><dd>{fmt_num(item.get('lag_hours'), 1)}h</dd></div>
-          </dl>
-        </article>
-        """
-        for item in data["status"]
+        SELECT batch_id, uploaded_at, as_of_date, original_filename, file_sha256, status,
+               message, is_archived, total_assets, position_count, meta_json
+        FROM portfolio_import_batches
+        WHERE {where_sql}
+        ORDER BY as_of_date DESC, uploaded_at DESC, batch_id DESC
+        LIMIT %s OFFSET %s
+        """,
+        tuple(params + [filters["per_page"], offset]),
     )
-    index_rows = "\n".join(
-        f"""
-        <tr>
-          <td>{item['asset_name']}</td>
-          <td>{fmt_num(item['value'])}</td>
-          <td class="{'up' if (item.get('change_percent') or 0) >= 0 else 'down'}">{fmt_pct(item.get('change_percent'))}</td>
-          <td>{fmt_dt(item.get('ts'))}</td>
-        </tr>
+    months = rows(
         """
-        for item in data["cn_indices"]
-    )
-    quote_cards = "\n".join(
-        f"""
-        <article class="quote">
-          <span>{item['asset_name']}</span>
-          <strong>{fmt_num(item['value'])}</strong>
-          <em class="{'up' if (quote_change(item) or 0) >= 0 else 'down'}">
-            {fmt_pct(quote_change(item))}
-          </em>
-        </article>
+        SELECT to_char(as_of_date, 'YYYY-MM') AS month,
+               COUNT(*) AS upload_count,
+               COUNT(*) FILTER (WHERE status IN ('complete', 'partial')) AS success_count,
+               COUNT(*) FILTER (WHERE status = 'failed') AS failed_count
+        FROM portfolio_import_batches
+        WHERE true
+        GROUP BY to_char(as_of_date, 'YYYY-MM')
+        ORDER BY month DESC
         """
-        for item in data["cn_quotes"]
     )
-    flow_rows = "\n".join(
-        f"""
-        <tr>
-          <td>{item['asset_name'].replace(' 主力净流入', '')}</td>
-          <td class="{'up' if (item.get('value') or 0) >= 0 else 'down'}">{money_cn(item.get('value'))}</td>
-          <td>{fmt_dt(item.get('ts'))}</td>
-        </tr>
-        """
-        for item in data["market_flow"]
-    )
-    us_quote_cards = "\n".join(
-        f"""
-        <article class="quote">
-          <span>{item['source_symbol'] or item['asset_name']}</span>
-          <strong>{fmt_num(item['value'])}</strong>
-          <em class="{'up' if (item.get('change_percent') or 0) >= 0 else 'down'}">
-            {fmt_pct(item.get('change_percent'))}
-          </em>
-        </article>
-        """
-        for item in data["us_equities"]
-    )
-    filing_items = "\n".join(
-        f"""
-        <article class="filing">
-          <div>
-            <strong>{item['source_symbol']}</strong>
-            <span>{fmt_dt(item.get('ts'))}</span>
-          </div>
-          <a href="{item.get('url') or '#'}" target="_blank" rel="noreferrer">{item['title']}</a>
-          <p>{esc(item['asset_name'])}</p>
-        </article>
-        """
-        for item in data["sec_filings"]
-    )
-    evidence_items = ""
-    if report:
-        evidence_items = "\n".join(
-            f"""
-            <article class="filing">
-              <div>
-                <strong>{item['evidence_type']}</strong>
-                <span>{fmt_dt(item.get('ts'))}</span>
-              </div>
-              <a href="{item.get('url') or '#'}" target="_blank" rel="noreferrer">{item['title']}</a>
-              <p>{esc(item.get('detail') or item.get('source') or '')}</p>
-            </article>
-            """
-            for item in report.get("evidence", [])
+    return {"batches": data, "total": total, "months": months, "page": filters["page"], "per_page": filters["per_page"]}
+
+
+@app.get("/uploads", response_class=HTMLResponse)
+def uploads_page(request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    filters = upload_filters(request)
+    result = upload_query(filters)
+    status_options = "".join(f"<option value='{value}' {'selected' if filters['status'] == value else ''}>{label}</option>" for value, label in [("", "全部状态"), ("complete", "complete"), ("partial", "partial"), ("failed", "failed")])
+    month_cards = "".join(f"<a class='month-chip {'active' if item['month'] == filters['month'] else ''}' href='/uploads?month={item['month']}'>{esc(item['month'])}<b>{item['success_count']}/{item['upload_count']}</b></a>" for item in result["months"])
+    body_rows = "".join(
+        f"<tr class='status-{esc(i.get('status'))}'><td><a href='{batch_link(i['batch_id'])}'>{esc(i['batch_id'])}</a></td><td>{fmt_dt(i.get('uploaded_at'))}</td><td>{fmt_date(i.get('as_of_date'))}</td><td>{esc(i.get('original_filename'))}</td><td>{esc(i.get('status'))}</td><td>{money(i.get('total_assets'))}</td><td>{esc(i.get('position_count'))}</td><td>{esc(i.get('message'))}</td><td><form class='inline-form' action='/api/uploads/{esc(i['batch_id'])}/replace' method='post' enctype='multipart/form-data'><input type='file' name='file' accept='.xlsx' required><button type='submit'>替换</button></form></td></tr>"
+        for i in result["batches"]
+    ) or "<tr><td colspan='9' class='muted'>没有匹配记录</td></tr>"
+    pages = max(1, (int(result["total"]) + filters["per_page"] - 1) // filters["per_page"])
+    base_query = f"month={filters['month']}&status={filters['status']}&q={filters['q']}&start={filters['start']}&end={filters['end']}"
+    pager = f"<div class='pager'><a href='/uploads?{base_query}&page={max(1, filters['page']-1)}'>上一页</a><span>{filters['page']} / {pages}</span><a href='/uploads?{base_query}&page={min(pages, filters['page']+1)}'>下一页</a></div>"
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Files</p><h1>上传记录</h1><p class='subtitle'>按月份分页管理上传文件；重复文件会拒收。若某天文件有误，可直接在对应批次替换并重算分析。</p></div></section>{upload_form()}<section class='panel'><h2>月份</h2><div class='month-grid'>{month_cards}</div></section><section class='panel'><form class='filters' method='get'><label>月份<input name='month' value='{esc(filters['month'])}'></label><label>状态<select name='status'>{status_options}</select></label><label>文件/批次<input name='q' value='{esc(filters['q'])}'></label><label>开始<input type='date' name='start' value='{esc(filters['start'])}'></label><label>结束<input type='date' name='end' value='{esc(filters['end'])}'></label><button type='submit'>筛选</button></form></section><section class='panel'><div class='section-head'><h2>文件批次</h2><span class='muted'>替换会保留批次位置并重新解析报告</span></div><table><thead><tr><th>批次</th><th>上传时间</th><th>持仓日期</th><th>文件</th><th>状态</th><th>总资产</th><th>行数</th><th>消息</th><th>替换文件</th></tr></thead><tbody>{body_rows}</tbody></table>{pager}</section>"
+    return HTMLResponse(base_layout("上传记录", body, session_user(request)))
+
+
+@app.get("/timeline", response_class=HTMLResponse)
+def timeline_page(request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    months = max(1, min(60, int(request.query_params.get("months") or "6")))
+    data = analytics_timeline(months)
+    items = data["points"]
+    latest = items[-1] if items else None
+    table_rows = []
+    for i in reversed(items):
+        change = money(i.get("total_assets_change"), signed=True) if i.get("total_assets_change") is not None else "-"
+        compare_link = f"<a href='/compare?from={i['previous_batch_id']}&to={i['batch_id']}'>对比</a>" if i.get("previous_batch_id") else "-"
+        table_rows.append(
+            f"<tr><td><a href='{batch_link(i['batch_id'])}'>{fmt_date(i.get('as_of_date'))}</a></td><td>{esc(i.get('original_filename'))}</td><td>{money(i.get('total_assets'))}</td><td>{change}</td><td>{money(i.get('today_pnl'), signed=True)}</td><td>{money(i.get('holding_pnl'), signed=True)}</td><td>{money(i.get('cumulative_pnl'), signed=True)}</td><td>{pct(i.get('top5_weight'))}</td><td>{pct(i.get('equity_like_weight'))}</td><td>{pct(i.get('bond_like_weight'))}</td><td>{pct(i.get('qdii_weight'))}</td><td>{pct(i.get('cash_weight'))}</td><td>{compare_link}</td></tr>"
         )
-    count_rows = "\n".join(
-        f"""
-        <tr>
-          <td>{item['provider']}</td>
-          <td>{item['category']}</td>
-          <td>{item['rows']}</td>
-          <td>{fmt_dt(item.get('latest'))}</td>
-        </tr>
-        """
-        for item in data["asset_counts"]
+    rows_html = "".join(table_rows) or "<tr><td colspan='13' class='muted'>暂无成功批次</td></tr>"
+    summary = metric_cards(latest, batch_metrics(latest["batch_id"])) if latest else ""
+    risk = data.get("risk") or {}
+    risk_cards = "<section class='metrics'>" + "".join(
+        f"<article><span>{esc(label)}</span><strong>{esc(value)}</strong></article>"
+        for label, value in [
+            ("最大单仓", pct(risk.get("max_position_weight"))),
+            ("Top 5", pct(risk.get("top5_weight"))),
+            ("最大行业", f"{risk.get('max_industry_name') or '-'} {pct(risk.get('max_industry_weight'))}"),
+            ("估算最大回撤", pct(risk.get("max_drawdown_estimated"), signed=True)),
+            ("连续亏损批次", str(risk.get("trailing_loss_streak") or 0)),
+            ("现金/货币", pct(risk.get("cash_weight"))),
+        ]
+    ) + "</section>"
+    controls = f"<div class='actions'><a href='/timeline?months=3'>近3月</a><a href='/timeline?months=6'>近6月</a><a href='/timeline?months=12'>近12月</a><a href='/api/analytics/timeline?months={months}'>JSON</a></div>"
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Portfolio cockpit</p><h1>趋势驾驶舱</h1><p class='subtitle'>用上传文件生成连续组合状态：资产、盈亏、集中度、股债漂移和 X-Ray 风险来源。</p></div></section>{upload_form()}{controls}{summary}{risk_cards}<section class='grid two'><article class='panel'><h2>总资产趋势</h2>{svg_line_chart([('总资产', data['series'].get('assets', []), '#0f766e')], money_values=True)}</article><article class='panel'><h2>盈亏曲线</h2>{svg_line_chart([('当日盈亏', data['series'].get('today_pnl', []), '#be123c'), ('持有盈亏', data['series'].get('holding_pnl', []), '#2563eb'), ('累计盈亏', data['series'].get('cumulative_pnl', []), '#d97706')], money_values=True)}</article></section><section class='grid two'><article class='panel'><h2>集中度变化</h2>{svg_line_chart([('Top3', data['series'].get('top3_weight', []), '#0f766e'), ('Top5', data['series'].get('top5_weight', []), '#2563eb'), ('Top10', data['series'].get('top10_weight', []), '#7c3aed')], pct_values=True)}</article><article class='panel'><h2>股债/QDII/现金漂移</h2>{svg_line_chart([('股性', data['series'].get('equity_like_weight', []), '#be123c'), ('债性', data['series'].get('bond_like_weight', []), '#0f766e'), ('QDII', data['series'].get('qdii_weight', []), '#2563eb'), ('现金', data['series'].get('cash_weight', []), '#475569')], pct_values=True)}</article></section><section class='panel'><h2>资产类型堆叠面积</h2>{svg_stacked_allocation(data.get('allocation_history') or {}, items)}</section><section class='panel'><h2>较上一批 Top 变化</h2>{top_changes_table(data.get('top_changes') or [])}</section>{xray_panel(data.get('xray') or {})}<section class='panel'><h2>批次时间线</h2><table><thead><tr><th>持仓日期</th><th>文件</th><th>总资产</th><th>较上批</th><th>当日盈亏</th><th>持有盈亏</th><th>累计盈亏</th><th>Top5</th><th>股性</th><th>债性</th><th>QDII</th><th>现金</th><th>操作</th></tr></thead><tbody>{rows_html}</tbody></table></section>"
+    return HTMLResponse(base_layout("趋势驾驶舱", body, session_user(request)))
+
+
+@app.get("/reports/{batch_id}", response_class=HTMLResponse)
+def report_page(batch_id: str, request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    batch = one("SELECT * FROM portfolio_import_batches WHERE batch_id = %s", (batch_id,))
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    metrics = batch_metrics(batch_id)
+    positions = batch_positions(batch_id, 80)
+    alloc = asset_allocation(batch_id)
+    industries = industry_allocation(batch_id)
+    under_rows = "".join(f"<tr><td>{esc(t.get('underlying_code'))}</td><td>{esc(t.get('underlying_name'))}</td><td>{esc(t.get('underlying_type'))}</td><td>{money(t.get('amount'))}</td><td>{pct(t.get('weight'))}</td><td>{esc(t.get('source_count'))}</td></tr>" for t in underlying(batch_id))
+    tx_rows = "".join(f"<tr><td>{fmt_date(t.get('trade_date'))}</td><td>{esc(t.get('transaction_type'))}</td><td>{esc(t.get('security_code') or '')}</td><td>{esc(t.get('security_name') or '')}</td><td>{money(t.get('cash_flow_amount'))}</td><td>{money(t.get('fee'))}</td></tr>" for t in recent_transactions(batch_id))
+    prev = previous_success(batch_id)
+    compare = f"<a href='/compare?from={prev['batch_id']}&to={batch_id}'>较上一批</a>" if prev else ""
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Report</p><h1>{fmt_date(batch.get('as_of_date'))}</h1><p class='subtitle'>{esc(batch_id)}</p></div><div class='hero-meta'><span>状态</span><strong>{esc(batch.get('status'))}</strong><span>上传</span><strong>{fmt_dt(batch.get('uploaded_at'))}</strong></div></section><div class='actions'><a href='/api/portfolio/{batch_id}'>JSON</a>{compare}</div>{metric_cards(batch, metrics)}<section class='grid two'><article class='panel'><h2>资产类型</h2>{bar_chart(alloc, 'allocation_bucket', 'weight')}</article><article class='panel'><h2>行业/主题</h2>{bar_chart(industries, 'industry_name', 'weight')}</article></section><section class='panel'><h2>报告正文</h2><pre class='report-text'>{esc(batch.get('report_markdown'))}</pre></section><section class='panel'><h2>持仓明细</h2>{positions_table(positions)}</section><section class='grid two'><article class='panel'><h2>穿透/代理重仓</h2><table><thead><tr><th>代码</th><th>名称</th><th>类型</th><th>金额</th><th>权重</th><th>来源</th></tr></thead><tbody>{under_rows}</tbody></table></article><article class='panel'><h2>最近交易</h2><table><thead><tr><th>日期</th><th>类型</th><th>代码</th><th>名称</th><th>发生额</th><th>费用</th></tr></thead><tbody>{tx_rows}</tbody></table></article></section>"
+    return HTMLResponse(base_layout("报告", body, session_user(request)))
+
+
+@app.get("/compare", response_class=HTMLResponse)
+def compare_page(request: Request):
+    redirect = redirect_if_guest(request)
+    if redirect:
+        return redirect
+    from_batch = request.query_params.get("from")
+    to_batch = request.query_params.get("to")
+    if not from_batch or not to_batch:
+        raise HTTPException(status_code=400, detail="from and to are required")
+    data = compare_batches(from_batch, to_batch)
+    rows_html = "".join(f"<tr><td>{esc(i['security_code'])}</td><td>{esc(i['security_name'])}</td><td>{money(i['old_amount'])}</td><td>{money(i['new_amount'])}</td><td>{pct(i['new_weight'] - i['old_weight'], signed=True)}</td><td>{money(i['new_pnl'] - i['old_pnl'])}</td></tr>" for i in data["positions"])
+    body = f"<section class='hero compact'><div><p class='eyebrow'>Compare</p><h1>批次对比</h1><p class='subtitle'>{esc(from_batch)} → {esc(to_batch)}</p></div></section><section class='metrics'><article><span>总资产变化</span><strong>{money(data['summary']['total_assets_change'])}</strong></article><article><span>持仓数变化</span><strong>{data['summary']['position_count_change']:+d}</strong></article><article><span>Top5 变化</span><strong>{pct(data['summary']['top5_weight_change'], signed=True)}</strong></article></section><section class='panel'><table><thead><tr><th>代码</th><th>名称</th><th>旧金额</th><th>新金额</th><th>仓位变化</th><th>盈亏变化</th></tr></thead><tbody>{rows_html}</tbody></table></section>"
+    return HTMLResponse(base_layout("批次对比", body, session_user(request)))
+
+
+async def store_upload_file(file: UploadFile, uploaded_at: datetime, as_of_override: date | None, seen_hashes: set[str] | None = None) -> dict[str, Any]:
+    filename = file.filename or "portfolio.xlsx"
+    if not filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail=f"Only .xlsx files are supported: {filename}")
+    seen_hashes = seen_hashes if seen_hashes is not None else set()
+    day_dir = UPLOAD_ROOT / uploaded_at.strftime("%Y") / uploaded_at.strftime("%m") / uploaded_at.strftime("%d")
+    day_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = day_dir / f"tmp-{secrets.token_hex(8)}.xlsx"
+    size = 0
+    with temp_path.open("wb") as handle:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                temp_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail=f"File is too large: {filename}")
+            handle.write(chunk)
+    digest = sha256_file(temp_path)
+    inferred_date = as_of_override or portfolio.infer_as_of_date(temp_path, filename)
+    existing = find_existing_upload(digest)
+    if existing or digest in seen_hashes:
+        temp_path.unlink(missing_ok=True)
+        duplicate_of = existing["batch_id"] if existing else "same upload request"
+        return {
+            "accepted": False,
+            "filename": filename,
+            "file_sha256": digest,
+            "as_of_date": existing.get("as_of_date") if existing else inferred_date,
+            "duplicate_of": duplicate_of,
+            "reason": "重复文件，已拒收，未保存也未写入记录",
+        }
+    seen_hashes.add(digest)
+    batch_id = make_batch_id(uploaded_at, digest)
+    stored_path = day_dir / f"{batch_id}_{safe_filename(filename)}"
+    shutil.move(str(temp_path), stored_path)
+    result = process_upload(stored_path, filename, uploaded_at, digest, as_of_override or inferred_date)
+    result["accepted"] = True
+    return result
+
+
+@app.post("/api/upload")
+async def upload_portfolio(request: Request):
+    require_user(request)
+    form = await request.form()
+    upload_items = []
+    for field_name in ("files", "file"):
+        upload_items.extend(item for item in form.getlist(field_name) if getattr(item, "filename", None))
+    if not upload_items:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    date_text = str(form.get("as_of_date") or "").strip()
+    try:
+        parsed_date = date.fromisoformat(date_text) if date_text else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid as_of_date") from exc
+    for item in upload_items:
+        filename = item.filename or ""
+        if not filename.lower().endswith(".xlsx"):
+            raise HTTPException(status_code=400, detail=f"Only .xlsx files are supported: {filename}")
+    results = []
+    skipped = []
+    seen_hashes: set[str] = set()
+    base_time = now_utc()
+    for index, item in enumerate(upload_items):
+        result = await store_upload_file(item, base_time + timedelta(microseconds=index), parsed_date, seen_hashes)
+        if result.get("accepted"):
+            results.append(result)
+        else:
+            skipped.append(result)
+    return upload_result_page(results, skipped, session_user(request))
+
+
+@app.get("/api/portfolio/latest")
+def api_latest(request: Request):
+    require_user(request)
+    batch = latest_batch()
+    return {"ok": True, "batch": json_ready(batch)} if not batch else api_portfolio(batch["batch_id"], request)
+
+
+@app.get("/api/portfolio/{batch_id}")
+def api_portfolio(batch_id: str, request: Request):
+    require_user(request)
+    batch = one("SELECT * FROM portfolio_import_batches WHERE batch_id = %s", (batch_id,))
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return json_ready({"ok": True, "batch": batch, "metrics": batch_metrics(batch_id), "positions": batch_positions(batch_id), "asset_allocation": asset_allocation(batch_id), "industry_allocation": industry_allocation(batch_id), "underlying": underlying(batch_id), "transactions": recent_transactions(batch_id)})
+
+
+@app.get("/api/uploads")
+def api_uploads(request: Request):
+    require_user(request)
+    filters = upload_filters(request)
+    return json_ready({"ok": True, "filters": filters, **upload_query(filters)})
+
+
+@app.get("/api/analytics/timeline")
+def api_analytics_timeline(request: Request, months: int = 6):
+    require_user(request)
+    months = max(1, min(60, months))
+    return json_ready({"ok": True, "months": months, **analytics_timeline(months)})
+
+
+@app.get("/api/analytics/xray")
+def api_analytics_xray(request: Request, batch_id: str = ""):
+    require_user(request)
+    batch = one("SELECT batch_id FROM portfolio_import_batches WHERE batch_id = %s", (batch_id,)) if batch_id else latest_batch()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return json_ready({"ok": True, **xray_data(batch["batch_id"])})
+
+
+@app.post("/api/uploads/{batch_id}/replace")
+async def replace_batch(batch_id: str, request: Request, file: UploadFile = File(...)):
+    require_user(request)
+    existing = one("SELECT * FROM portfolio_import_batches WHERE batch_id = %s", (batch_id,))
+    if not existing:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    filename = file.filename or "portfolio.xlsx"
+    if not filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Only .xlsx files are supported")
+    uploaded_at = now_utc()
+    day_dir = UPLOAD_ROOT / uploaded_at.strftime("%Y") / uploaded_at.strftime("%m") / uploaded_at.strftime("%d")
+    day_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = day_dir / f"tmp-replace-{secrets.token_hex(8)}.xlsx"
+    size = 0
+    with temp_path.open("wb") as handle:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                temp_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail=f"File is too large: {filename}")
+            handle.write(chunk)
+    digest = sha256_file(temp_path)
+    if digest == existing.get("file_sha256"):
+        temp_path.unlink(missing_ok=True)
+        body = "<section class='hero compact'><div><p class='eyebrow'>No change</p><h1>无需替换</h1><p class='subtitle'>上传文件与当前批次完全相同，系统没有做任何改动。</p></div></section><div class='actions'><a href='/uploads'>返回上传记录</a></div>"
+        return HTMLResponse(base_layout("无需替换", body, session_user(request)))
+    duplicate = one(
+        "SELECT batch_id FROM portfolio_import_batches WHERE file_sha256 = %s AND batch_id <> %s AND status IN ('complete', 'partial') LIMIT 1",
+        (digest, batch_id),
     )
-    recent_qa_rows = "\n".join(
-        f"""
-        <button class="qa-item" type="button" data-qa-id="{esc(item.get('qa_id'))}">
-          <div>
-            <strong>{'OK' if item.get('ok') else '失败'}</strong>
-            <span>{fmt_dt(item.get('created_at'))}</span>
-          </div>
-          <p>{esc(item.get('question') or '')}</p>
-        </button>
-        """
-        for item in serialize(rows(
-            """
-            SELECT qa_id, question, ok, created_at
-            FROM agent_question_answers
-            ORDER BY created_at DESC
-            LIMIT 6
-            """
-        ))
-    )
-    alert = (
-        f"<div class='alert'>{len(failed)} 个数据源最近一次同步失败。通常是 AKShare/东方财富接口临时断连；已有历史数据仍会保留。</div>"
-        if failed
-        else "<div class='alert ok'>所有启用的数据源最近一次同步正常。</div>"
-    )
-    return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Market AI Research</title>
-  <link rel="stylesheet" href="/ai/static/styles.css">
-</head>
-<body>
-  <header class="topbar">
-    <a href="/" class="brand">Market Overview</a>
-    <nav>
-      <a href="/ai/">AI 研究</a>
-      <a href="/ai/api/summary">JSON</a>
-    </nav>
-  </header>
-  <main>
-    <section class="hero">
-      <div>
-        <p class="eyebrow">基于已有数据的研究工作台</p>
-        <h1>AI 研究</h1>
-        <p class="subtitle">用 A股行情、行业资金流、全球宏观和 SEC 证据生成研究报告，并支持直接提问。</p>
-      </div>
-      <div class="hero-meta">
-        <span>页面生成时间</span>
-        <strong>{fmt_dt(generated_at)}</strong>
-      </div>
-    </section>
-    {alert}
-    <section class="workspace-grid">
-      <section class="ask-panel panel">
-        <header>
-          <div>
-            <h2>问 AI</h2>
-            <p>基于当前数据库里的行情、资金流、宏观与 SEC 证据回答。</p>
-          </div>
-        </header>
-        <div class="ask-body">
-          <textarea id="question" rows="3" placeholder="例如：根据现有数据，帮我写一份今天的市场研究报告，重点看A股资金流、指数表现和主要风险。"></textarea>
-          <div class="ask-actions">
-            <button id="askButton" type="button">生成回答</button>
-            <span id="askStatus"></span>
-          </div>
-          <article id="answer" class="answer" hidden>
-            <div class="answer-meta" id="answerMeta"></div>
-            <div class="answer-content" id="answerContent"></div>
-          </article>
-        </div>
-      </section>
-      <aside class="panel qa-panel">
-        <header>
-          <h2>最近问答</h2>
-          <p>点击可打开完整回答，也可以重新填入问题继续追问。</p>
-        </header>
-        <div id="recentQaList" class="qa-list">{recent_qa_rows}</div>
-        <article id="qaDetail" class="answer compact" hidden>
-          <div class="answer-meta" id="qaDetailMeta"></div>
-          <div class="answer-content" id="qaDetailContent"></div>
-        </article>
-      </aside>
-    </section>
-    <section class="two-col tool-grid">
-      <article class="panel tool-panel">
-        <header>
-          <h2>资产搜索</h2>
-          <p>输入代码、中文名或主题词，例如 英伟达、宁德时代、半导体ETF。</p>
-        </header>
-        <div class="tool-body">
-          <div class="inline-search">
-            <input id="assetQuery" type="search" placeholder="搜索资产或主题">
-            <button id="assetButton" type="button">搜索</button>
-            <button id="assetClear" class="ghost-button" type="button">清空</button>
-          </div>
-          <div id="assetResults" class="result-list"></div>
-          <button id="assetMore" class="ghost-button more-button" type="button" hidden>显示更多</button>
-          <article id="assetSummary" class="answer compact" hidden>
-            <div class="answer-meta" id="assetSummaryMeta"></div>
-            <div class="answer-content" id="assetSummaryContent"></div>
-          </article>
-        </div>
-      </article>
-      <article class="panel tool-panel">
-        <header>
-          <h2>证据搜索</h2>
-          <p>搜索公告、新闻、SEC 正文和财务文本，例如 配售新H股、CAO。</p>
-        </header>
-        <div class="tool-body">
-          <div class="inline-search">
-            <input id="evidenceQuery" type="search" placeholder="搜索证据关键词">
-            <button id="evidenceButton" type="button">搜索</button>
-            <button id="evidenceClear" class="ghost-button" type="button">清空</button>
-          </div>
-          <div id="evidenceResults" class="result-list"></div>
-          <button id="evidenceMore" class="ghost-button more-button" type="button" hidden>显示更多</button>
-          <article id="evidenceDetail" class="answer compact" hidden>
-            <div class="answer-meta" id="evidenceDetailMeta"></div>
-            <div class="answer-content" id="evidenceDetailContent"></div>
-          </article>
-        </div>
-      </article>
-    </section>
-    {report_html}
-    <p class="status-note">数据源状态说明：OK 表示最近一次同步成功；同步失败表示最近一次拉取接口失败，通常不代表历史数据被删除。</p>
-    <details class="panel fold-panel">
-      <summary>数据源状态</summary>
-      <section class="grid status-grid">{status_cards}</section>
-    </details>
-    <details class="panel fold-panel">
-      <summary>行情样本</summary>
-      <section class="two-col nested-grid">
-      <article class="inner-panel">
-        <header><h2>A股指数</h2></header>
-        <table>
-          <thead><tr><th>名称</th><th>数值</th><th>涨跌</th><th>观测日期</th></tr></thead>
-          <tbody>{index_rows}</tbody>
-        </table>
-      </article>
-      <article class="inner-panel">
-        <header><h2>A股日线样本</h2></header>
-        <div class="quotes">{quote_cards}</div>
-      </article>
-      <article class="inner-panel">
-        <header><h2>美股日线样本</h2></header>
-        <div class="quotes">{us_quote_cards}</div>
-      </article>
-      <article class="inner-panel">
-        <header><h2>A股市场资金流</h2></header>
-        <table>
-          <thead><tr><th>项目</th><th>主力净流入</th><th>观测日期</th></tr></thead>
-          <tbody>{flow_rows}</tbody>
-        </table>
-      </article>
-      </section>
-    </details>
-    <details class="panel fold-panel">
-      <summary>SEC 近期文件</summary>
-      <article class="inner-panel">
-        <header><h2>SEC 证据</h2></header>
-        <div class="filings">{filing_items}</div>
-      </article>
-    </details>
-    <details class="panel fold-panel">
-      <summary>数据资产清单</summary>
-      <table>
-        <thead><tr><th>来源</th><th>类别</th><th>行数</th><th>最新日期</th></tr></thead>
-        <tbody>{count_rows}</tbody>
-      </table>
-    </details>
-    <details class="panel fold-panel">
-      <summary>Agent 报告证据</summary>
-      <div class="filings">{evidence_items}</div>
-    </details>
-  </main>
-</body>
-<script>
-const button = document.getElementById('askButton');
-const question = document.getElementById('question');
-const statusEl = document.getElementById('askStatus');
-const answer = document.getElementById('answer');
-const answerMeta = document.getElementById('answerMeta');
-const answerContent = document.getElementById('answerContent');
-const assetQuery = document.getElementById('assetQuery');
-const assetButton = document.getElementById('assetButton');
-const assetClear = document.getElementById('assetClear');
-const assetResults = document.getElementById('assetResults');
-const assetMore = document.getElementById('assetMore');
-const assetSummary = document.getElementById('assetSummary');
-const assetSummaryMeta = document.getElementById('assetSummaryMeta');
-const assetSummaryContent = document.getElementById('assetSummaryContent');
-const evidenceQuery = document.getElementById('evidenceQuery');
-const evidenceButton = document.getElementById('evidenceButton');
-const evidenceClear = document.getElementById('evidenceClear');
-const evidenceResults = document.getElementById('evidenceResults');
-const evidenceMore = document.getElementById('evidenceMore');
-const evidenceDetail = document.getElementById('evidenceDetail');
-const evidenceDetailMeta = document.getElementById('evidenceDetailMeta');
-const evidenceDetailContent = document.getElementById('evidenceDetailContent');
-const recentQaList = document.getElementById('recentQaList');
-const qaDetail = document.getElementById('qaDetail');
-const qaDetailMeta = document.getElementById('qaDetailMeta');
-const qaDetailContent = document.getElementById('qaDetailContent');
-let assetSearchItems = [];
-let assetVisibleCount = 8;
-let evidenceSearchItems = [];
-let evidenceVisibleCount = 6;
-let askInFlight = false;
+    if duplicate:
+        temp_path.unlink(missing_ok=True)
+        body = f"<section class='hero compact'><div><p class='eyebrow'>Replace rejected</p><h1>替换失败</h1><p class='subtitle'>这个文件和已有批次 {esc(duplicate['batch_id'])} 完全相同，已拒收。</p></div></section><div class='actions'><a href='/uploads'>返回上传记录</a></div>"
+        return HTMLResponse(base_layout("替换失败", body, session_user(request)), status_code=409)
+    stored_path = day_dir / f"{batch_id}_replacement_{safe_filename(filename)}"
+    shutil.move(str(temp_path), stored_path)
+    old_file = existing.get("source_file")
+    meta = existing.get("meta_json") or {}
+    history = list(meta.get("replacement_history") or [])
+    history.append({
+        "replaced_at": uploaded_at.isoformat(),
+        "old_filename": existing.get("original_filename"),
+        "old_file_sha256": existing.get("file_sha256"),
+        "old_source_file": old_file,
+        "new_filename": filename,
+        "new_file_sha256": digest,
+    })
+    execute("UPDATE portfolio_import_batches SET meta_json = %s WHERE batch_id = %s", (Json(meta | {"replacement_history": history}), batch_id))
+    as_of_date = portfolio.infer_as_of_date(stored_path, filename) or existing.get("as_of_date")
+    result = process_upload(stored_path, filename, uploaded_at, digest, as_of_date, batch_id)
+    if old_file and old_file != str(stored_path):
+        try:
+            Path(old_file).rename(Path(old_file).with_suffix(Path(old_file).suffix + ".replaced"))
+        except OSError:
+            pass
+    return RedirectResponse(batch_link(result["batch_id"]), status_code=303)
 
-function escapeHtml(text) {{
-  return String(text || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
-}}
 
-function inlineMarkdown(text) {{
-  return escapeHtml(text).replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>');
-}}
+@app.get("/api/health")
+def health():
+    return {"ok": True, "app": "portfolio", "time": now_utc().isoformat()}
 
-function renderMarkdown(text) {{
-  const lines = String(text || '').replace(/\\r\\n/g, '\\n').split('\\n');
-  const html = [];
-  let paragraph = [];
-  let list = [];
 
-  function flushParagraph() {{
-    if (paragraph.length) {{
-      html.push(`<p>${{inlineMarkdown(paragraph.join(' '))}}</p>`);
-      paragraph = [];
-    }}
-  }}
-
-  function flushList() {{
-    if (list.length) {{
-      html.push(`<ul>${{list.map(item => `<li>${{inlineMarkdown(item)}}</li>`).join('')}}</ul>`);
-      list = [];
-    }}
-  }}
-
-  for (const rawLine of lines) {{
-    const line = rawLine.trim();
-    if (!line) {{
-      flushParagraph();
-      flushList();
-      continue;
-    }}
-    const heading = line.match(/^(#{2,5})\\s+(.+)$/);
-    if (heading) {{
-      flushParagraph();
-      flushList();
-      const level = Math.min(heading[1].length, 4);
-      html.push(`<h${{level}}>${{inlineMarkdown(heading[2])}}</h${{level}}>`);
-      continue;
-    }}
-    const bullet = line.match(/^[-*]\\s+(.+)$/) || line.match(/^\\d+[.)]\\s+(.+)$/);
-    if (bullet) {{
-      flushParagraph();
-      list.push(bullet[1]);
-      continue;
-    }}
-    flushList();
-    paragraph.push(line);
-  }}
-  flushParagraph();
-  flushList();
-  return html.join('');
-}}
-
-function postJson(url, payload) {{
-  return new Promise((resolve, reject) => {{
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url, true);
-    xhr.timeout = 120000;
-    xhr.setRequestHeader('Content-Type', 'application/json');
-    xhr.setRequestHeader('Accept', 'application/json');
-    xhr.onload = () => {{
-      if (xhr.status < 200 || xhr.status >= 300) {{
-        reject(new Error(`HTTP ${{xhr.status}}: ${{xhr.responseText || '请求失败'}}`));
-        return;
-      }}
-      try {{
-        resolve(JSON.parse(xhr.responseText));
-      }} catch (err) {{
-        reject(new Error(`返回内容不是 JSON：${{xhr.responseText.slice(0, 120)}}`));
-      }}
-    }};
-    xhr.onerror = () => reject(new Error('网络连接失败，请刷新页面后重试'));
-    xhr.ontimeout = () => reject(new Error('请求超时，问题可以问得短一点再试'));
-    xhr.send(JSON.stringify(payload));
-  }});
-}}
-
-async function getJson(url) {{
-  const response = await fetch(url, {{headers: {{'Accept': 'application/json'}}}});
-  if (!response.ok) {{
-    throw new Error(`HTTP ${{response.status}}`);
-  }}
-  return response.json();
-}}
-
-function renderAssetItems(items) {{
-  if (!items || !items.length) return '<p class="empty">没有匹配资产</p>';
-  return items.map(item => `
-    <button class="result-item" type="button" data-symbol="${{escapeHtml(item.source_symbol || item.asset_key || '')}}">
-      <strong>${{escapeHtml(item.source_symbol || '-')}}</strong>
-      <span>${{escapeHtml(item.asset_name || '')}}</span>
-      <em>${{escapeHtml(item.market || '')}}</em>
-    </button>
-  `).join('');
-}}
-
-function paintAssetResults() {{
-  const visible = assetSearchItems.slice(0, assetVisibleCount);
-  assetResults.innerHTML = renderAssetItems(visible);
-  assetMore.hidden = assetSearchItems.length <= assetVisibleCount;
-}}
-
-function renderEvidenceItems(items) {{
-  if (!items || !items.length) return '<p class="empty">没有匹配证据</p>';
-  return items.map(item => `
-    <button class="evidence-item" type="button" data-evidence-id="${{escapeHtml(item.evidence_id || '')}}">
-      <div><strong>${{escapeHtml(item.evidence_type || item.category || item.source || '')}}</strong><span>${{escapeHtml(item.ts || '-')}}</span></div>
-      <span class="evidence-title">${{escapeHtml(item.title || '')}}</span>
-      <p>${{escapeHtml(item.summary || item.body_excerpt || item.asset_name || '')}}</p>
-    </button>
-  `).join('');
-}}
-
-function paintEvidenceResults() {{
-  const visible = evidenceSearchItems.slice(0, evidenceVisibleCount);
-  evidenceResults.innerHTML = renderEvidenceItems(visible);
-  evidenceMore.hidden = evidenceSearchItems.length <= evidenceVisibleCount;
-}}
-
-function renderEvidenceDetail(item) {{
-  const url = item.url
-    ? `<p><a href="${{escapeHtml(item.url)}}" target="_blank" rel="noreferrer">打开原文链接</a></p>`
-    : '';
-  evidenceDetailMeta.textContent = `${{item.source || '-'}} · ${{item.evidence_type || '-'}} · ${{item.ts || '-'}}`;
-  evidenceDetailContent.innerHTML = `
-    <h3>${{escapeHtml(item.title || '证据详情')}}</h3>
-    <p><strong>关联资产：</strong>${{escapeHtml(item.source_symbol || item.asset_name || item.asset_key || '-')}}</p>
-    <p><strong>摘要：</strong>${{escapeHtml(item.summary || '-')}}</p>
-    <p><strong>本地正文片段：</strong>${{escapeHtml(item.body_excerpt || '本条证据暂无正文片段，仅保存了元数据和原文链接。')}}</p>
-    ${{url}}
-  `;
-  evidenceDetail.hidden = false;
-}}
-
-function renderQaList(items) {{
-  if (!items || !items.length) return '<p class="empty">还没有问答记录</p>';
-  return items.slice(0, 8).map(item => `
-    <button class="qa-item" type="button" data-qa-id="${{escapeHtml(item.qa_id || '')}}">
-      <div>
-        <strong>${{item.ok ? 'OK' : '失败'}}</strong>
-        <span>${{escapeHtml(item.created_at || '-')}}</span>
-      </div>
-      <p>${{escapeHtml(item.question || '')}}</p>
-    </button>
-  `).join('');
-}}
-
-async function refreshRecentQa() {{
-  try {{
-    const items = await getJson('/ai/api/qa/recent');
-    recentQaList.innerHTML = renderQaList(items || []);
-  }} catch (err) {{
-    recentQaList.innerHTML = `<p class="empty">问答列表刷新失败：${{escapeHtml(err.message || err)}}</p>`;
-  }}
-}}
-
-async function loadQaDetail(qaId) {{
-  if (!qaId) return;
-  qaDetail.hidden = true;
-  qaDetailMeta.textContent = '正在加载历史问答...';
-  const data = await getJson(`/ai/api/qa/${{encodeURIComponent(qaId)}}`);
-  if (!data.ok) {{
-    qaDetailMeta.textContent = '未找到问答';
-    qaDetailContent.innerHTML = `<p>${{escapeHtml(data.message || '没有找到这条问答')}}</p>`;
-    qaDetail.hidden = false;
-    return;
-  }}
-  const item = data.item || {{}};
-  const evidence = ((item.context_summary || {{}}).related_text_evidence || []).slice(0, 5);
-  qaDetailMeta.textContent = `${{item.model || '模型'}} · ${{item.created_at || '-'}}`;
-  qaDetailContent.innerHTML = `
-    <h3>${{escapeHtml(item.question || '')}}</h3>
-    <div class="qa-actions"><button id="reuseQuestion" class="ghost-button" type="button">重新提问</button></div>
-    ${{renderMarkdown(item.answer || item.error_message || '没有回答内容')}}
-    <h4>当时使用的证据</h4>
-    ${{renderEvidenceItems(evidence)}}
-  `;
-  const reuse = qaDetailContent.querySelector('#reuseQuestion');
-  if (reuse) {{
-    reuse.addEventListener('click', () => {{
-      question.value = item.question || '';
-      question.focus();
-      window.scrollTo({{top: question.getBoundingClientRect().top + window.scrollY - 110, behavior: 'smooth'}});
-    }});
-  }}
-  qaDetail.hidden = false;
-}}
-
-async function loadAssetSummary(symbol) {{
-  if (!symbol) return;
-  assetSummary.hidden = true;
-  assetSummaryMeta.textContent = '正在加载标的摘要...';
-  const data = await getJson(`/ai/api/assets/${{encodeURIComponent(symbol)}}/summary`);
-  if (!data.ok) {{
-    assetSummaryMeta.textContent = '未找到资产';
-    assetSummaryContent.innerHTML = `<p>${{escapeHtml(data.message || '没有匹配结果')}}</p>`;
-    assetSummary.hidden = false;
-    return;
-  }}
-  const bars = data.daily_bars_summary || {{}};
-  assetSummaryMeta.textContent = `${{data.asset.source_symbol || ''}} · ${{data.asset.asset_name || ''}}`;
-  assetSummaryContent.innerHTML = `
-    <p><strong>最新收盘：</strong>${{escapeHtml(bars.latest_close ?? '-')}}，日期 ${{escapeHtml(bars.latest_date || '-')}}</p>
-    <p><strong>收益率：</strong>5日 ${{escapeHtml((bars.return_5d_pct ?? '-').toString())}}%，20日 ${{escapeHtml((bars.return_20d_pct ?? '-').toString())}}%，60日 ${{escapeHtml((bars.return_60d_pct ?? '-').toString())}}%</p>
-    <h4>相关证据</h4>
-    ${{renderEvidenceItems((data.evidence || []).slice(0, 6))}}
-  `;
-  assetSummary.hidden = false;
-}}
-
-button.addEventListener('click', async () => {{
-  if (askInFlight) return;
-  const value = question.value.trim();
-  if (!value) {{
-    statusEl.textContent = '请输入问题';
-    return;
-  }}
-  askInFlight = true;
-  button.disabled = true;
-  statusEl.textContent = '正在基于数据库上下文生成...';
-  answer.hidden = true;
-  answerMeta.textContent = '';
-  answerContent.innerHTML = '';
-  try {{
-    const data = await postJson('/ai/api/ask', {{question: value}});
-    answerMeta.textContent = data.model ? `模型：${{data.model}}` : '回答结果';
-    answerContent.innerHTML = renderMarkdown(data.answer || '没有返回内容');
-    answer.hidden = false;
-    statusEl.textContent = '完成';
-    await refreshRecentQa();
-  }} catch (err) {{
-    answerMeta.textContent = '回答失败';
-    answerContent.innerHTML = `<p>${{escapeHtml(err.message || err)}}</p>`;
-    answer.hidden = false;
-    statusEl.textContent = '';
-  }} finally {{
-    askInFlight = false;
-    button.disabled = false;
-  }}
-}});
-
-assetButton.addEventListener('click', async () => {{
-  const value = assetQuery.value.trim();
-  if (!value) return;
-  assetButton.disabled = true;
-  assetVisibleCount = 8;
-  assetSummary.hidden = true;
-  assetResults.innerHTML = '<p class="empty">搜索中...</p>';
-  assetMore.hidden = true;
-  try {{
-    const data = await getJson(`/ai/api/assets/search?q=${{encodeURIComponent(value)}}&limit=40`);
-    assetSearchItems = data.items || [];
-    paintAssetResults();
-  }} catch (err) {{
-    assetResults.innerHTML = `<p class="empty">搜索失败：${{escapeHtml(err.message || err)}}</p>`;
-  }} finally {{
-    assetButton.disabled = false;
-  }}
-}});
-
-assetMore.addEventListener('click', () => {{
-  assetVisibleCount += 8;
-  paintAssetResults();
-}});
-
-assetClear.addEventListener('click', () => {{
-  assetQuery.value = '';
-  assetSearchItems = [];
-  assetResults.innerHTML = '';
-  assetMore.hidden = true;
-  assetSummary.hidden = true;
-}});
-
-assetResults.addEventListener('click', async (event) => {{
-  const item = event.target.closest('.result-item');
-  if (!item) return;
-  try {{
-    await loadAssetSummary(item.dataset.symbol);
-  }} catch (err) {{
-    assetSummaryMeta.textContent = '加载失败';
-    assetSummaryContent.innerHTML = `<p>${{escapeHtml(err.message || err)}}</p>`;
-    assetSummary.hidden = false;
-  }}
-}});
-
-evidenceButton.addEventListener('click', async () => {{
-  const value = evidenceQuery.value.trim();
-  if (!value) return;
-  evidenceButton.disabled = true;
-  evidenceVisibleCount = 6;
-  evidenceDetail.hidden = true;
-  evidenceResults.innerHTML = '<p class="empty">搜索中...</p>';
-  evidenceMore.hidden = true;
-  try {{
-    const data = await getJson(`/ai/api/evidence/search?q=${{encodeURIComponent(value)}}&limit=60`);
-    evidenceSearchItems = data.items || [];
-    paintEvidenceResults();
-  }} catch (err) {{
-    evidenceResults.innerHTML = `<p class="empty">搜索失败：${{escapeHtml(err.message || err)}}</p>`;
-  }} finally {{
-    evidenceButton.disabled = false;
-  }}
-}});
-
-evidenceMore.addEventListener('click', () => {{
-  evidenceVisibleCount += 6;
-  paintEvidenceResults();
-}});
-
-evidenceClear.addEventListener('click', () => {{
-  evidenceQuery.value = '';
-  evidenceSearchItems = [];
-  evidenceResults.innerHTML = '';
-  evidenceMore.hidden = true;
-  evidenceDetail.hidden = true;
-}});
-
-evidenceResults.addEventListener('click', async (event) => {{
-  const item = event.target.closest('.evidence-item');
-  if (!item) return;
-  try {{
-    const data = await getJson(`/ai/api/evidence/${{encodeURIComponent(item.dataset.evidenceId)}}`);
-    if (data.ok) {{
-      renderEvidenceDetail(data.item || {{}});
-    }} else {{
-      evidenceDetailMeta.textContent = '未找到证据';
-      evidenceDetailContent.innerHTML = `<p>${{escapeHtml(data.message || '没有找到这条证据')}}</p>`;
-      evidenceDetail.hidden = false;
-    }}
-  }} catch (err) {{
-    evidenceDetailMeta.textContent = '加载失败';
-    evidenceDetailContent.innerHTML = `<p>${{escapeHtml(err.message || err)}}</p>`;
-    evidenceDetail.hidden = false;
-  }}
-}});
-
-recentQaList.addEventListener('click', async (event) => {{
-  const item = event.target.closest('.qa-item');
-  if (!item) return;
-  try {{
-    await loadQaDetail(item.dataset.qaId);
-  }} catch (err) {{
-    qaDetailMeta.textContent = '加载失败';
-    qaDetailContent.innerHTML = `<p>${{escapeHtml(err.message || err)}}</p>`;
-    qaDetail.hidden = false;
-  }}
-}});
-
-qaDetailContent.addEventListener('click', async (event) => {{
-  const item = event.target.closest('.evidence-item');
-  if (!item) return;
-  try {{
-    const data = await getJson(`/ai/api/evidence/${{encodeURIComponent(item.dataset.evidenceId)}}`);
-    if (data.ok) renderEvidenceDetail(data.item || {{}});
-  }} catch (err) {{
-    evidenceDetailMeta.textContent = '加载失败';
-    evidenceDetailContent.innerHTML = `<p>${{escapeHtml(err.message || err)}}</p>`;
-    evidenceDetail.hidden = false;
-  }}
-}});
-
-assetSummaryContent.addEventListener('click', async (event) => {{
-  const item = event.target.closest('.evidence-item');
-  if (!item) return;
-  try {{
-    const data = await getJson(`/ai/api/evidence/${{encodeURIComponent(item.dataset.evidenceId)}}`);
-    if (data.ok) renderEvidenceDetail(data.item || {{}});
-  }} catch (err) {{
-    evidenceDetailMeta.textContent = '加载失败';
-    evidenceDetailContent.innerHTML = `<p>${{escapeHtml(err.message || err)}}</p>`;
-    evidenceDetail.hidden = false;
-  }}
-}});
-</script>
-</html>"""
+CSS = """
+:root { color-scheme: light; --bg: #f6f7f4; --ink: #151817; --muted: #65706b; --line: #dfe4df; --panel: #fff; --accent: #0f766e; --bad: #b91c1c; }
+* { box-sizing: border-box; } body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; } a { color: inherit; } .topbar { position: sticky; top: 0; z-index: 10; display:flex; justify-content:space-between; align-items:center; padding: 14px 28px; border-bottom:1px solid var(--line); background: rgba(246,247,244,.94); backdrop-filter: blur(10px); } .brand { font-weight: 800; text-decoration:none; } nav { display:flex; gap: 18px; color: var(--muted); flex-wrap:wrap; } nav a { text-decoration:none; } main { width:min(1440px, 100%); margin:0 auto; padding:28px; } .hero { display:flex; justify-content:space-between; align-items:end; gap:24px; min-height: 190px; padding: 34px 0 28px; border-bottom:1px solid var(--line); } .hero.compact { min-height: 130px; } .eyebrow { margin:0 0 8px; color:var(--accent); font-weight:800; text-transform:uppercase; } h1 { margin:0; font-size: clamp(42px, 7vw, 88px); line-height:.92; letter-spacing:0; } h2 { margin:0 0 14px; font-size: 18px; } .subtitle { margin:14px 0 0; max-width: 800px; color: var(--muted); font-size: 17px; } .hero-meta { display:grid; gap:4px; text-align:right; min-width:230px; } .hero-meta span, .muted { color:var(--muted); } .upload, .filters { display:flex; flex-wrap:wrap; gap:12px; align-items:end; padding:16px; margin:18px 0; border:1px solid var(--line); background:var(--panel); border-radius:8px; } label { display:grid; gap:6px; color:var(--muted); font-weight:700; } input, select { min-height:40px; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); } button, .actions a, .section-head a, .pager a { display:inline-flex; align-items:center; min-height:40px; padding:0 14px; border:1px solid #0f766e; border-radius:6px; background:#0f766e; color:white; text-decoration:none; font-weight:800; } .actions { display:flex; gap:10px; margin:16px 0; flex-wrap:wrap; } .metrics { display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap:12px; margin: 18px 0; } .metrics article, .panel { border:1px solid var(--line); border-radius:8px; background:var(--panel); } .metrics article { padding:14px; } .metrics span { display:block; color:var(--muted); font-size:12px; text-transform:uppercase; } .metrics strong { display:block; margin-top:6px; font-size:22px; overflow-wrap:anywhere; } .grid { display:grid; gap:14px; margin:14px 0; } .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); } .panel { padding:16px; overflow:hidden; margin:14px 0; } .section-head { display:flex; justify-content:space-between; align-items:center; gap:16px; } .bars { display:grid; gap:10px; } .bar-row { display:grid; grid-template-columns: minmax(110px, 190px) minmax(120px, 1fr) 90px; gap:10px; align-items:center; } .bar-row span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .bar-row div { height:12px; background:#edf1ed; border-radius:999px; overflow:hidden; } .bar-row i { display:block; height:100%; background:#0f766e; border-radius:999px; } .bar-row b { text-align:right; font-size:12px; } .table-wrap { overflow:auto; } table { width:100%; border-collapse:collapse; font-size:13px; } th, td { padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-size:12px; text-transform:uppercase; } tr.status-failed td { color: var(--bad); } tr.status-duplicate td, tr.status-partial td { color:#92400e; } .report-text { white-space:pre-wrap; margin:0; padding:14px; max-height: 520px; overflow:auto; border:1px solid var(--line); border-radius:8px; background:#fbfcfa; color:#23302a; } .login { width:min(420px, 100%); margin:80px auto; padding:24px; border:1px solid var(--line); border-radius:8px; background:var(--panel); } .login h1 { font-size:42px; margin-bottom:20px; } .login form { display:grid; gap:14px; } .form-hint { align-self:center; margin:0; color:var(--muted); max-width:420px; } .chart { width:100%; height:auto; min-height:220px; overflow:visible; } .chart line { stroke:var(--line); } .chart text { fill:var(--muted); font-size:12px; } .chart-legend { display:flex; flex-wrap:wrap; gap:12px; margin:0 0 8px; color:var(--muted); font-weight:700; } .chart-legend span { display:inline-flex; align-items:center; gap:6px; } .chart-legend i { width:10px; height:10px; border-radius:999px; display:inline-block; } .month-grid { display:flex; flex-wrap:wrap; gap:10px; } .month-chip { display:inline-grid; gap:2px; min-width:112px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:#fbfcfa; text-decoration:none; } .month-chip.active { border-color:var(--accent); box-shadow: inset 0 0 0 1px var(--accent); } .month-chip b { color:var(--accent); } .inline-form { display:flex; gap:8px; align-items:center; margin:0; } .inline-form input { max-width:220px; } .inline-form button { min-height:36px; } .pager { display:flex; gap:12px; justify-content:flex-end; align-items:center; margin-top:14px; color:var(--muted); }
+@media (max-width: 900px) { main { padding:18px; } .hero { display:block; } .hero-meta { text-align:left; margin-top:18px; } .grid.two, .metrics { grid-template-columns:1fr; } .bar-row { grid-template-columns: 1fr; gap:4px; } .bar-row b { text-align:left; } table { min-width: 900px; } .panel { overflow:auto; } }
+"""

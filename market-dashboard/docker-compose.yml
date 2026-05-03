@@ -17,55 +17,32 @@ services:
       timeout: 5s
       retries: 10
 
-  grafana:
-    image: grafana/grafana:latest
-    container_name: market-dashboard-grafana
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "127.0.0.1:${GRAFANA_HTTP_PORT:-3001}:3000"
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-      GF_SERVER_DOMAIN: ${GRAFANA_DOMAIN}
-      GF_SERVER_ROOT_URL: https://${GRAFANA_DOMAIN}
-      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/market-overview.json
-    volumes:
-      - ${MARKET_DATA_ROOT:-./data}/grafana:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/etc/grafana/dashboards
-
-  ai-research:
+  portfolio-app:
     build:
       context: .
-      dockerfile: Dockerfile.ai
-    container_name: market-dashboard-ai-research
+      dockerfile: Dockerfile
+    container_name: portfolio-app
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
     working_dir: /app
     ports:
-      - "127.0.0.1:${AI_RESEARCH_HTTP_PORT:-8001}:8000"
+      - "127.0.0.1:${PORTFOLIO_HTTP_PORT:-8001}:8000"
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
-      AGENT_REPORT_TYPE: ${AGENT_REPORT_TYPE:-market_research_v1}
-      AGENT_TEMPERATURE: ${AGENT_TEMPERATURE:-0.2}
-      AGENT_LLM_TIMEOUT_SECONDS: ${AGENT_LLM_TIMEOUT_SECONDS:-90}
+      PORTFOLIO_ADMIN_USERNAME: ${PORTFOLIO_ADMIN_USERNAME:-admin}
+      PORTFOLIO_ADMIN_PASSWORD: ${PORTFOLIO_ADMIN_PASSWORD}
+      PORTFOLIO_SESSION_SECRET: ${PORTFOLIO_SESSION_SECRET:-${POSTGRES_PASSWORD}}
+      PORTFOLIO_MAX_UPLOAD_BYTES: ${PORTFOLIO_MAX_UPLOAD_BYTES:-26214400}
+      PORTFOLIO_LOGIN_FAILURE_LIMIT: ${PORTFOLIO_LOGIN_FAILURE_LIMIT:-5}
+      PORTFOLIO_LOGIN_LOCKOUT_MINUTES: ${PORTFOLIO_LOGIN_LOCKOUT_MINUTES:-30}
+      PORTFOLIO_UPLOAD_ROOT: /var/lib/portfolio-app/uploads
+      PORTFOLIO_AKSHARE_ENABLED: ${PORTFOLIO_AKSHARE_ENABLED:-false}
     volumes:
       - .:/app:ro
+      - ${PORTFOLIO_DATA_ROOT:-/var/lib/portfolio-app}:/var/lib/portfolio-app
