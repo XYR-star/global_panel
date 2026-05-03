@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from typing import Any
 
@@ -125,12 +126,25 @@ def _public_fetch(watchlist: list[dict[str, Any]], since: date) -> list[Announce
     return out
 
 
+def _secret_values(secret: str) -> dict[str, str]:
+    try:
+        data = json.loads(secret)
+    except json.JSONDecodeError:
+        return {"access_token": secret}
+    if not isinstance(data, dict):
+        return {"access_token": secret}
+    return {str(key): str(value) for key, value in data.items() if value}
+
+
 def _official_fetch(watchlist: list[dict[str, Any]], since: date, config: dict[str, Any], secret: str) -> list[Announcement]:
     path = str(config.get("api_path") or config.get("official_api_path") or "").strip()
     if not path:
         raise RuntimeError("CNINFO official API path is not configured")
     url = path if path.startswith("http") else f"{OFFICIAL_BASE}{path if path.startswith('/') else '/' + path}"
-    token_param = str(config.get("token_param") or "key").strip() or "key"
+    credentials = _secret_values(secret)
+    token_param = str(config.get("token_param") or "access_token").strip()
+    access_key_param = str(config.get("access_key_param") or "accessKey").strip()
+    access_secret_param = str(config.get("access_secret_param") or "accessSecret").strip()
     method = str(config.get("method") or "POST").upper()
     start_key = str(config.get("start_date_param") or "sdate")
     end_key = str(config.get("end_date_param") or "edate")
@@ -142,7 +156,7 @@ def _official_fetch(watchlist: list[dict[str, Any]], since: date, config: dict[s
     }
     auth_header = str(config.get("auth_header") or "").strip()
     if auth_header:
-        headers[auth_header] = secret
+        headers[auth_header] = credentials.get("access_token") or credentials.get("token") or secret
     timeout = httpx.Timeout(15.0, connect=6.0)
     out: list[Announcement] = []
     with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True) as client:
@@ -152,9 +166,14 @@ def _official_fetch(watchlist: list[dict[str, Any]], since: date, config: dict[s
                 symbol_key: code,
                 start_key: since.isoformat(),
                 end_key: date.today().isoformat(),
-                token_param: secret,
                 **extra_params,
             }
+            if token_param and (credentials.get("access_token") or credentials.get("token")):
+                params[token_param] = credentials.get("access_token") or credentials.get("token")
+            if access_key_param and credentials.get("access_key"):
+                params[access_key_param] = credentials["access_key"]
+            if access_secret_param and credentials.get("access_secret"):
+                params[access_secret_param] = credentials["access_secret"]
             response = client.request(method, url, params=params if method == "GET" else None, data=params if method != "GET" else None)
             response.raise_for_status()
             payload = response.json()

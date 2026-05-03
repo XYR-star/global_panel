@@ -67,7 +67,7 @@ Default sources:
 - `tushare` — disabled by default; can be enabled with a token for structured enhancement.
 - `sec_edgar` — disabled placeholder for future overseas holdings.
 
-CNINFO can run in three modes from `/settings/data-sources`: official API first with fallback, official API only, or public announcement search only. If you have a paid CNINFO data-service token, enter it on the settings page and fill the official API path from the CNINFO data-service documentation. Tokens are encrypted and never displayed again.
+CNINFO can run in three modes from `/settings/data-sources`: official API first with fallback, official API only, or public announcement search only. If you have paid CNINFO data-service credentials, enter Access Key, Access Secret, and Access Token on the settings page, then fill the official API path from the CNINFO data-service documentation. These values are encrypted and never displayed again. Parameter names are configurable because different CNINFO APIs may name credentials and date/symbol fields differently.
 
 Events support read, favorite, and ignored state. AI insights are optional and only run against already-stored announcements.
 
